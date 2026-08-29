@@ -456,6 +456,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         self._fish_speech_tokenizer = None
         self._covo_audio_tokenizer = None
+        # MiniCPM-o 4.5 omni pipeline detection: LLM stage feeds a "tts"
+        # stage.  Detected during init from the stage configs; caches the
+        # shared tokenizer used to render the official chat template.
+        self._minicpmo45_pipeline = any(
+            getattr(getattr(s, "engine_args", None), "model_stage", None) == "tts"
+            and getattr(getattr(s, "engine_args", None), "model_arch", None)
+            == "MiniCPMO45OmniForConditionalGeneration"
+            for s in self.engine_client.stage_configs
+        )
+        self._minicpmo45_tokenizer: Any | None = None
+        # Per-request fast-first-audio threshold for streaming MiniCPM-o 4.5
+        # requests. Read from the tts stage connector extra config
+        # (initial_codec_chunk_frames); 0/absent disables the feature.
+        # Applied per-request (streaming only) instead of globally so
+        # non-streaming callers keep the steady chunk_frames threshold.
+        self._minicpmo45_stream_initial_chunk_frames = self._read_minicpmo45_initial_chunk_frames()
         # Cached per process: the CosyVoice3 Qwen tokenizer + resolved model
         # path used for dynamic-token sizing. Without this, every request
         # re-ran snapshot_download + reloaded the tokenizer (~100 ms on the
@@ -556,11 +572,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         For VoxCPM2 this shifts ~15s of torch.compile + CUDA Graph capture from
         the first user request to server startup.
         """
-        if self._tts_model_type != "voxcpm2":
+        is_minicpmo45 = (
+            self._tts_model_type is None
+            and getattr(self, "_minicpmo45_pipeline", False)
+        )
+        if self._tts_model_type not in ("voxcpm2",) and not is_minicpmo45:
             return
+        model_type_label = "minicpmo45" if is_minicpmo45 else self._tts_model_type
 
         t0 = time.time()
-        logger.info("Running warmup speech request for model_type=%s", self._tts_model_type)
+        logger.info("Running warmup speech request for model_type=%s", model_type_label)
         # VoxCPM2 has no predefined speaker presets — "default" means zero-shot
         # mode (no voice cloning).  The voice field is required by the OpenAI
         # API schema but semantically ignored by the model.
@@ -685,6 +706,117 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if model_arch in _MING_TTS_MODEL_ARCHS and worker_type == "ar":
                 return stage
         return None
+
+    _MINICPMO45_AUDIO_ASSISTANT_PROMPT = (
+        "Use the <reserved_53> voice. Please assist users while maintaining "
+        "this voice style. Please answer the user's questions seriously and "
+        "in a high quality. Please chat with the user in a highly human-like "
+        "and oral style. You are a helpful assistant developed by ModelBest: "
+        "MiniCPM-Omni."
+    )
+
+    def _read_minicpmo45_initial_chunk_frames(self) -> int:
+        """Read initial_codec_chunk_frames from the tts stage connector extra.
+
+        Mirrors the stage-input processor's config lookup so the API layer
+        and the processor agree on one yaml knob. Returns 0 when unset or
+        when it would not accelerate (>= steady codec_chunk_frames).
+
+        MiniCPM-o 4.5's ``model_stage="tts"`` is not in ``_TTS_MODEL_STAGES``
+        (that set drives TTS-only serving branches), so ``_tts_stage`` is
+        None here. Read the connector ``extra`` straight from the deploy
+        YAML (``engine_client.config_path``) instead — the tts→code2wav
+        connector is where the stage-input processor reads it too.
+        """
+        extra: dict[str, Any] = {}
+        try:
+            tts_stage = self._tts_stage
+            if tts_stage is not None:
+                connector = getattr(tts_stage, "connector", None)
+                raw_config = getattr(connector, "config", {}) or {}
+                extra = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+        except (TypeError, ValueError, AttributeError):
+            extra = {}
+        if not extra:
+            try:
+                from vllm_omni.config.stage_config import load_deploy_config
+
+                config_path = getattr(self.engine_client, "config_path", None)
+                if config_path:
+                    connectors = getattr(load_deploy_config(config_path), "connectors", None) or {}
+                    for conn in connectors.values():
+                        conn_extra = (conn or {}).get("extra", {}) if isinstance(conn, dict) else {}
+                        if "initial_codec_chunk_frames" in conn_extra:
+                            extra = conn_extra
+                            break
+            except Exception:
+                extra = {}
+        if not isinstance(extra, dict):
+            return 0
+        try:
+            initial = int(extra.get("initial_codec_chunk_frames") or 0)
+            steady = int(extra.get("codec_chunk_frames") or 0)
+            if initial <= 0 or (steady > 0 and initial >= steady):
+                return 0
+            return initial
+        except (TypeError, ValueError):
+            return 0
+
+    async def _build_minicpmo45_speech_prompt(self, request) -> dict:
+        """Render the MiniCPM-o 4.5 chat template for /v1/audio/speech.
+
+        The tts stage conditions on the LLM stage's chat-templated tokens.
+        The generic path (raw ``{"prompt": text}``) skips the chat
+        scaffolding, so the LLM never emits a natural end-of-turn and rambles
+        to its max_tokens cap (~82 s for a short greeting).  Render the
+        official chat template with the audio_assistant system prompt
+        instead; the template already terminates with ``<|tts_bos|>`` when
+        ``use_tts_template=True``.
+        """
+        from transformers import AutoTokenizer
+
+        if self._minicpmo45_tokenizer is None:
+            # ``engine_client.model_config.model`` resolves to the local
+            # checkpoint path (the served-model alias would hit the hub).
+            model_path = self.engine_client.model_config.model
+            self._minicpmo45_tokenizer = await asyncio.to_thread(
+                AutoTokenizer.from_pretrained, model_path, trust_remote_code=True
+            )
+
+        voice = request.voice or ""
+        system_prompt = self._MINICPMO45_AUDIO_ASSISTANT_PROMPT
+        # Voice selection: <reserved_53> is the default timbre token; swap it
+        # when the caller passes an explicit voice name.
+        reserved = self._minicpmo45_tokenizer.convert_tokens_to_ids("<reserved_53>")
+        if voice and reserved is not None:
+            voice_ids = [
+                self._minicpmo45_tokenizer.convert_tokens_to_ids(f"<reserved_{i}>")
+                for i in range(52, 67)
+            ]
+            if voice in voice_ids:
+                system_prompt = system_prompt.replace(
+                    f"<{reserved}>", f"<{voice}>", 1
+                )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.input},
+        ]
+        rendered = await asyncio.to_thread(
+            self._minicpmo45_tokenizer.apply_chat_template,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            use_tts_template=True,
+        )
+        prompt_ids = await asyncio.to_thread(
+            lambda: self._minicpmo45_tokenizer(rendered, add_special_tokens=False)[
+                "input_ids"
+            ]
+        )
+        tts_bos_id = self._minicpmo45_tokenizer.convert_tokens_to_ids("<|tts_bos|>")
+        if tts_bos_id not in prompt_ids:
+            prompt_ids = list(prompt_ids) + [tts_bos_id]
+        return {"prompt_token_ids": prompt_ids}
 
     def _detect_tts_model_type(self) -> str | None:
         """Detect TTS model type from the stage's model_stage attribute."""
@@ -3115,8 +3247,38 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "models like Qwen3-Omni, use /v1/chat/completions with "
                     '\'"modalities": ["audio"]\' instead.'
                 )
-            tts_params = {}
-            prompt = {"prompt": request.input}
+            if "tts" in stage_names and self._minicpmo45_pipeline:
+                # MiniCPM-o 4.5 omni pipeline: the "tts" stage consumes the
+                # LLM stage's chat-templated output as its conditioning
+                # prompt.  Feeding raw text (the historical generic path)
+                # makes the LLM ramble to its max_tokens cap because the
+                # prompt lacks the chat scaffolding (system role, role
+                # turns, generation header).  Render the official chat
+                # template here with the audio_assistant system prompt so
+                # the LLM answers concisely and stops naturally.
+                prompt = await self._build_minicpmo45_speech_prompt(request)
+                # Fast first audio for streaming requests only: the smaller
+                # initial chunk threshold (initial_codec_chunk_frames, issue
+                # #5069) trades one extra small stage2 decode for ~0.5s lower
+                # first-chunk latency. Pointless for non-streaming callers
+                # (they wait for the full waveform anyway) where it only adds
+                # a small-bucket decode that cannot co-batch with peers under
+                # concurrency, so explicitly disable it there via a
+                # per-request 0 override. Routed to the stage-input processor
+                # through prompt additional_information (same wire path the
+                # qwen3 adapter uses).
+                tts_params = (
+                    {"initial_codec_chunk_frames": [self._minicpmo45_stream_initial_chunk_frames]}
+                    if (
+                        request.is_streaming()
+                        and (self._minicpmo45_stream_initial_chunk_frames or 0) > 0
+                    )
+                    else {"initial_codec_chunk_frames": [0]}
+                )
+                prompt["additional_information"] = tts_params
+            else:
+                tts_params = {}
+                prompt = {"prompt": request.input}
 
         if model_type is None:
             if self._is_tts:

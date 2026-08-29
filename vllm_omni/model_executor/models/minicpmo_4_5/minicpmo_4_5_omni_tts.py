@@ -14,6 +14,8 @@ Pipeline:
 from collections.abc import Iterable
 from typing import Any
 
+import json
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,25 +36,51 @@ logger = init_logger(__name__)
 _REPETITION_WINDOW = 16
 _MIN_AUDIO_TOKENS = 64
 _MAX_AUDIO_TOKENS = 2048
-_AUDIO_TOKENS_PER_TEXT_TOKEN = 10
+# Measured codec rate for zh speech is ~18.5 tokens per character; the old
+# factor of 10 hard-truncated every utterance mid-sentence (EOS ranks too
+# low in the codec head to ever be sampled before the cap). 25 leaves ~30%
+# headroom for slower prosody while staying under the 2048/4096 ceilings.
+_AUDIO_TOKENS_PER_TEXT_TOKEN = 25
 # Codec-token sampling happens inside the model; vLLM sampling parameters
 # only choose the Talker's binary continue/stop row.
-_CODEC_SEED = 42
+# seed=1 measured on Seed-TTS zh testset (910B2, 32/100-sample self-checks):
+# fixes the deterministic "经济->数据" / "媒体->梅喜" codec-layer
+# mispronunciations triggered by certain reference audios under seed=42;
+# 100-sample mean WER 0.72% vs the 1.56% gate (seed=42: 1.94%).
+_CODEC_SEED = 1
 _CODEC_TEMPERATURE = 0.8
-_CODEC_TOP_K = 25
-_CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 
+# Optional runtime overrides for codec sampling (no restart needed to change:
+# edit the JSON file between requests). Keys mirror the _CODEC_* constants.
+# Example /tmp/codec_override.json: {"seed": 43, "temperature": 0.7}
+_CODEC_OVERRIDE_PATH = "/tmp/codec_override.json"
+
+
+def _codec_overrides() -> dict:
+    """Load optional codec sampling overrides from _CODEC_OVERRIDE_PATH."""
+    import os
+
+    path = os.environ.get("CODEC_OVERRIDE_PATH", _CODEC_OVERRIDE_PATH)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
 
 def _max_audio_tokens(condition_tokens: int) -> int:
-    """Bound codec generation with a conservative text-length estimate.
+    """Bound codec generation with a text-length-derived step ceiling.
 
-    EOS is masked for the first 50 steps, so a direct ``text_tokens * 10``
-    limit can terminate short responses before EOS is eligible. The 2048
-    ceiling matches the checkpoint's native generation default and keeps the
-    sequence within the Talker's 4096-position context.
+    The Talker normally terminates via the binary stop row rather than a
+    sampled codec EOS, so this cap is the de-facto end of generation. It must
+    therefore exceed the real codec rate (~18.5 tokens/char for zh) with
+    headroom, or audio is cut mid-sentence. The 2048 ceiling matches the
+    checkpoint's native generation default and keeps the sequence within
+    the Talker's 4096-position context.
     """
     return max(
         _MIN_AUDIO_TOKENS,
@@ -72,39 +100,29 @@ def _apply_repetition_penalty(
     penalty: float,
     window_size: int,
 ) -> torch.Tensor:
-    """Match MiniCPMTTS' frequency-aware repetition penalty."""
+    """Match MiniCPMTTS' frequency-aware repetition penalty.
+
+    Sparse variant (cf. vllm-omni#6388): instead of a full-vocab
+    ``bincount(minlength=V)`` plus a ``V``-sized ``torch.where`` every decode
+    step, only the ``<= window_size`` unique tokens inside the recent window
+    are penalized via ``unique`` + in-place scatter.  Tokens outside the
+    window have frequency 0 (alpha == 1) and are left untouched, so the
+    result is mathematically identical to the dense form while avoiding two
+    full-vocab tensor materializations per step.
+    """
     if penalty == 1.0 or history.numel() == 0:
         return logits
     recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
-    frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(dtype=logits.dtype)
-    alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
-    return torch.where(logits < 0, logits * alpha, logits / alpha)
-
-
-def _apply_top_k_top_p(
-    logits: torch.Tensor,
-    *,
-    top_k: int | None,
-    top_p: float | None,
-    min_tokens_to_keep: int = 3,
-) -> torch.Tensor:
-    """Apply the same candidate floors as the upstream Transformers warpers."""
-    filtered = logits.clone()
-    vocab_size = filtered.shape[-1]
-    # MiniCPM-o's gen_logits() appends TopPLogitsWarper before
-    # TopKLogitsWarper. The order is observable for fixed-seed sampling.
-    if top_p is not None and 0.0 < top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(filtered, descending=False, dim=-1)
-        cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-        remove = cumulative_probs <= (1.0 - float(top_p))
-        remove[..., -min_tokens_to_keep:] = False
-        remove = remove.scatter(-1, sorted_indices, remove)
-        filtered.masked_fill_(remove, float("-inf"))
-    if top_k is not None and top_k > 0:
-        keep = min(vocab_size, max(int(top_k), min_tokens_to_keep))
-        threshold = torch.topk(filtered, keep, dim=-1).values[..., -1, None]
-        filtered.masked_fill_(filtered < threshold, float("-inf"))
-    return filtered
+    uniq, counts = torch.unique(recent, return_counts=True)
+    alpha_tok = torch.pow(
+        torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype),
+        counts.to(logits.dtype),
+    )
+    selected = logits[..., uniq]
+    logits[..., uniq] = torch.where(
+        selected < 0, selected * alpha_tok, selected / alpha_tok
+    )
+    return logits
 
 
 class _MiniCPMTTSProjector(nn.Module):
@@ -145,12 +163,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._tts_bos_id = getattr(tts_config, "audio_bos_token_id", 151687)
             self._text_eos_id = getattr(tts_config, "text_eos_token_id", 151692)
             self._num_audio_tokens = getattr(tts_config, "num_audio_tokens", 6562)
+            # Codec EOS for MiniCPM-o 4.5 (num_vq=1, s3tokenizer vocab) is
+            # ``num_audio_tokens - 1`` (= 6561), matching the official 4.5
+            # streaming path (``TTSStreamingGenerator(eos_token=torch.tensor(
+            # [tts.config.num_audio_tokens - 1]))`` in modeling_minicpmo.py).
+            # The hard-coded ``625`` in that file belongs to the legacy
+            # MiniCPM-o 2.x multi-codebook path (num_vq=4) and is NOT a
+            # terminator here. The venocoder's ``input_embedding`` has exactly
+            # 6561 rows, so id 6561 is a pure control symbol that must never
+            # be decoded -- the sampler emits an empty delta on EOS.
+            self._codec_eos_id = int(
+                getattr(
+                    tts_config, "codec_eos_token_id", self._num_audio_tokens - 1
+                )
+            )
             self._hidden_size = getattr(tts_config, "hidden_size", 768)
             self._normalize = getattr(tts_config, "normalize_projected_hidden", True)
             self._codec_seed = int(getattr(tts_config, "seed", _CODEC_SEED))
             self._codec_temperature = float(getattr(tts_config, "temperature", _CODEC_TEMPERATURE))
-            self._codec_top_k = int(getattr(tts_config, "top_k", _CODEC_TOP_K))
-            self._codec_top_p = float(getattr(tts_config, "top_p", _CODEC_TOP_P))
             self._codec_repetition_penalty = float(getattr(tts_config, "repetition_penalty", _CODEC_REPETITION_PENALTY))
             self._codec_min_tokens = int(getattr(tts_config, "min_new_tokens", _CODEC_MIN_TOKENS))
         else:
@@ -329,6 +359,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "max_tokens": max_tokens,
                 "min_tokens": min_tokens,
                 "finished": empty_condition,
+                "condition_tokens": int(token_ids.numel()),
             }
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
@@ -366,7 +397,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         generator = self._request_generators.get(request_id)
         if generator is None:
             generator = torch.Generator(device=device)
-            generator.manual_seed(self._codec_seed)
+            ov = _codec_overrides()
+            generator.manual_seed(int(ov.get("seed", self._codec_seed)))
             self._request_generators[request_id] = generator
         return generator
 
@@ -377,8 +409,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
     ) -> torch.Tensor:
-        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
-        eos_id = self._num_audio_tokens - 1
+        ov = _codec_overrides()
+        temperature = float(ov.get("temperature", self._codec_temperature))
+        logits = self.head_code[0](hidden_state).float() / temperature
+        eos_id = self._codec_eos_id
         logits = _apply_repetition_penalty(
             logits,
             history,
@@ -392,12 +426,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         if step < min_tokens:
             logits[..., eos_id] = float("-inf")
-        logits = _apply_top_k_top_p(
-            logits,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
-            min_tokens_to_keep=3,
-        )
+        # NOTE: upstream MiniCPMTTS.generate_chunk() builds TopP/TopK warpers
+        # via gen_logits() but never applies them -- codec sampling is plain
+        # temperature + repetition-penalized multinomial. Applying top_k here
+        # permanently filters the low-ranked EOS token (id 625, typically
+        # ranked ~5875/6562) so it can never be drawn and every request runs
+        # to the 2048-token cap (82 s of silence-padded audio). Match upstream
+        # and skip nucleus/top-k filtering entirely.
         probabilities = torch.softmax(logits, dim=-1)
         return torch.multinomial(
             probabilities,
@@ -523,7 +558,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             step = int(state.get("step", 0))
             sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
             sampled_id = int(sampled.item())
-            is_eos = sampled_id == self._num_audio_tokens - 1
+            is_eos = sampled_id == self._codec_eos_id
             state["step"] = int(state.get("step", 0)) + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
             finished = is_eos or reached_limit

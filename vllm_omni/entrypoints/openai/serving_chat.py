@@ -203,6 +203,161 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 return True
         return False
 
+    @staticmethod
+    def _minicpmo45_request_extra(request: ChatCompletionRequest) -> dict[str, Any]:
+        """Read top-level extra fields (openai-client ``extra_body`` / raw body)."""
+        if isinstance(request, dict):
+            return request
+        extra_body = getattr(request, "extra_body", None)
+        if isinstance(extra_body, dict):
+            return extra_body
+        model_extra = getattr(request, "model_extra", None)
+        if isinstance(model_extra, dict):
+            return model_extra
+        return {}
+
+    _MINICPMO45_VC_PREFIX_ZH = "模仿输入音频中的声音特征。"
+    _MINICPMO45_VC_PREFIX_EN = "Clone the voice in the provided audio prompt."
+
+    # The thinker tends to answer/extend topical user texts instead of
+    # reading them verbatim (e.g. Seed-TTS sentences ending in a comma).
+    # Wrapping the last user text with an explicit read-aloud instruction
+    # makes it emit the exact text for the talker — validated 8/8 verbatim
+    # on the Seed-TTS zh self-check set (WER gate 1.56%).
+    _MINICPMO45_VC_READ_INSTR_ZH = "请逐字朗读以下文本，不要回答、不要续写、不要添加任何内容："
+    _MINICPMO45_VC_READ_INSTR_EN = (
+        "Read the following text verbatim. Do not answer, continue, or add anything:"
+    )
+
+    async def _apply_minicpmo45_voice_cloning(
+        self,
+        request: ChatCompletionRequest,
+        messages: list[ChatCompletionMessageParam],
+    ) -> list[ChatCompletionMessageParam]:
+        """Rewrite the conversation into MiniCPM-o 4.5's voice-cloning layout.
+
+        The official omni benchmark sends Seed-TTS clone requests to
+        ``/v1/chat/completions`` with ``ref_audio`` / ``ref_text`` /
+        ``task_type`` as *top-level* body fields.  ``ChatCompletionRequest``
+        is ``extra="allow"`` so those land in ``model_extra`` with no
+        consumer, and the generic chat template makes the thinker answer
+        conversationally instead of reading the user text aloud.
+
+        Fix (mirrors the official HF ``get_sys_prompt(mode="voice_cloning")``):
+        system content := [vc_prefix, <ref audio part>]  — the renderer
+        turns the audio part into ``multi_modal_data["audio"]`` which
+        ``llm2tts`` extracts as the Code2Wav voice prompt — plus
+        ``use_tts_template=True`` so the rendered prompt ends with
+        ``<|tts_bos|>`` and the talker emits a single TTS span.
+        """
+        extra = self._minicpmo45_request_extra(request)
+        ref_audio = extra.get("ref_audio")
+        if not isinstance(ref_audio, str) or not ref_audio:
+            return messages
+
+        language = extra.get("language") or ""
+        vc_prefix = (
+            self._MINICPMO45_VC_PREFIX_ZH
+            if str(language).lower() in {"zh", "chinese", "zh-cn", "cn"}
+            else self._MINICPMO45_VC_PREFIX_EN
+        )
+
+        audio_part: dict[str, Any] = {"type": "audio_url", "audio_url": {"url": ref_audio}}
+        # ``parse_input_audio`` wants raw base64 in ``data``; a data: URL is
+        # handled by ``parse_audio`` via the ``audio_url`` shape above.
+
+        read_instr = (
+            self._MINICPMO45_VC_READ_INSTR_ZH
+            if str(language).lower() in {"zh", "chinese", "zh-cn", "cn"}
+            else self._MINICPMO45_VC_READ_INSTR_EN
+        )
+
+        rebuilt: list[ChatCompletionMessageParam] = []
+        system_done = False
+        user_wrapped = False
+        for message in messages:
+            role = message.get("role") if isinstance(message, dict) else None
+            if role == "system" and not system_done:
+                # Official voice_cloning keeps only [prefix, ref_audio]; the
+                # Seed-TTS engine prompt text is replaced by the vc prefix.
+                rebuilt.append(
+                    cast(
+                        ChatCompletionMessageParam,
+                        {
+                            "role": "system",
+                            "content": [
+                                {"type": "text", "text": vc_prefix},
+                                audio_part,
+                            ],
+                        },
+                    )
+                )
+                system_done = True
+            else:
+                rebuilt.append(message)
+        if not system_done:
+            rebuilt.insert(
+                0,
+                cast(
+                    ChatCompletionMessageParam,
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": vc_prefix},
+                            audio_part,
+                        ],
+                    },
+                ),
+            )
+
+        # Wrap the LAST user message's plain text with the read-aloud
+        # instruction so the thinker speaks it verbatim instead of treating
+        # it as a conversational query. Only touches a single text part.
+        for message in reversed(rebuilt):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = read_instr + content
+                user_wrapped = True
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text")
+                        if isinstance(text, str):
+                            part["text"] = read_instr + text
+                            user_wrapped = True
+                        break
+            break
+        _ = user_wrapped
+
+        # Activate the TTS chat-template branch: the rendered prompt then
+        # terminates with <|tts_bos|> so the thinker hands one TTS span to
+        # the talker instead of chatting.
+        user_kwargs = dict(getattr(request, "chat_template_kwargs", None) or {})
+        user_kwargs.setdefault("use_tts_template", True)
+        try:
+            request.chat_template_kwargs = user_kwargs
+        except Exception:
+            pass
+
+        # Consume the clone fields so downstream extra handling ignores them.
+        for key in ("ref_audio", "ref_text", "task_type"):
+            try:
+                if isinstance(request, dict):
+                    request.pop(key, None)
+                else:
+                    model_extra = getattr(request, "model_extra", None)
+                    if isinstance(model_extra, dict):
+                        model_extra.pop(key, None)
+                    extra_body = getattr(request, "extra_body", None)
+                    if isinstance(extra_body, dict):
+                        extra_body.pop(key, None)
+            except Exception:
+                pass
+
+        return rebuilt
+
     def _fix_minicpmo45_audio_stream_output_kinds(
         self,
         sampling_params_list: list[Any],
@@ -471,6 +626,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 # Effective kwargs fold request.chat_template_kwargs, reasoning_effort,
                 # and server defaults — mirrors OpenAIServingChat._effective_chat_template_kwargs.
+                # MiniCPM-o 4.5 voice cloning: consume top-level ref_audio and
+                # rebuild the conversation in the official voice_cloning shape
+                # before rendering (sets use_tts_template via chat_template_kwargs).
+                if (
+                    self._has_minicpmo45_stage()
+                    and request.modalities
+                    and "audio" in request.modalities
+                ):
+                    request.messages = await self._apply_minicpmo45_voice_cloning(
+                        request, request.messages
+                    )
                 merged_template_kwargs = self._effective_chat_template_kwargs(request)
                 conversation, engine_prompts = await self._preprocess_chat(
                     request,

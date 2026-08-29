@@ -762,6 +762,21 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
         use_float16 = bool(extra.get("token2wav_float16", False))
+        # CFM Euler steps. Upstream default is 10; 3 keeps zh WER at 1.46%
+        # vs the 1.56% gate (public 910C measurement) with ~3x fewer estimator
+        # forwards per mel chunk. 2 breaks engine init — 3 is the floor for
+        # the pure step-count reduction; go below it with jump_steps below.
+        n_timesteps = int(extra.get("token2wav_n_timesteps", 3))
+        # Trajectory jump: stop the CFM loop after this many estimator
+        # forwards and extrapolate to t=1 (see BatchedToken2Wav._decode_cfm).
+        # 0 disables (full n_timesteps loop). With n_timesteps=3, 2 equals
+        # two estimator forwards per chunk; 910C-measured RTF 0.3943 -> 0.37.
+        jump_steps = int(extra.get("token2wav_jump_steps", 0))
+        if jump_steps and jump_steps >= n_timesteps:
+            raise ValueError(
+                "MiniCPM-o Code2Wav token2wav_jump_steps must be < "
+                f"token2wav_n_timesteps ({n_timesteps}), got {jump_steps}"
+            )
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -771,8 +786,8 @@ class MiniCPMO45Code2Wav(nn.Module):
             token2wav = Token2wav(
                 str(token2wav_path),
                 float16=use_float16,
-                n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
+                n_timesteps=n_timesteps,
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+        self.backend = BatchedToken2Wav(token2wav, jump_steps=jump_steps)

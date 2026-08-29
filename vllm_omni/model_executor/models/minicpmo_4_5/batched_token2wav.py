@@ -60,9 +60,10 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(self, token2wav: Any, jump_steps: int = 0):
         super().__init__()
         self._token2wav = token2wav
+        self.jump_steps = int(jump_steps)
         self.flow = token2wav.flow
         self.hift = token2wav.hift
         # The upstream streaming path preallocates fixed-size CFM and DiT
@@ -140,12 +141,16 @@ class BatchedToken2Wav(nn.Module):
         )
 
     def _autocast(self, device: torch.device):
-        if device.type != "cuda":
+        # NPU (Ascend) exposes the same amp.autocast API via torch_npu, and
+        # 910B fp16 compute is ~4x fp32, so route "npu" through the same
+        # mixed-precision path instead of silently disabling autocast
+        # (cf. vllm-omni#5069 NPU performance).
+        if device.type not in ("cuda", "npu"):
             return nullcontext()
         if not self.float16:
-            return torch.amp.autocast("cuda", enabled=False)
+            return torch.amp.autocast(device.type, enabled=False)
         return torch.amp.autocast(
-            "cuda",
+            device.type,
             dtype=torch.float16,
         )
 
@@ -255,21 +260,32 @@ class BatchedToken2Wav(nn.Module):
             dtype=mu.dtype,
         )
         timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
-        time = timeline[0].expand(batch_size)
         mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
         cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
-        dt = timeline[1] - timeline[0]
+        # Operator-fusion micro-optimizations (cf. vllm-omni#5370):
+        # 1. Precompute every per-step ``time``/``dt`` as device scalars once,
+        #    instead of the original ``time = time + dt`` /
+        #    ``dt = timeline[step + 2] - time[0]`` chains that launch tiny
+        #    elementwise kernels on the accelerator each iteration.
+        # 2. Reuse a single ``(2B, ...)`` CFG buffer across steps via
+        #    ``copy_`` instead of re-allocating it with ``torch.cat`` every
+        #    step. Numerically identical to the concatenation form.
+        dts = torch.diff(timeline)
+        times = [timeline[step].expand(2 * batch_size) for step in range(self.n_timesteps)]
+        x_cfg = torch.empty((2 * batch_size, *x.shape[1:]), device=x.device, dtype=x.dtype)
         for step in range(self.n_timesteps):
             old_cnn = cnn_cache[step] if cnn_cache is not None else None
             old_att = att_cache[step] if att_cache is not None else None
+            x_cfg[:batch_size].copy_(x)
+            x_cfg[batch_size:].copy_(x)
             estimate, step_cnn, step_att = self._estimator_step(
                 estimator,
-                x=torch.cat((x, x), dim=0),
+                x=x_cfg,
                 mu=mu_cfg,
-                time=torch.cat((time, time), dim=0),
+                time=times[step],
                 speakers=speakers_cfg,
                 cond=cond_cfg,
                 cnn_cache=old_cnn,
@@ -277,10 +293,22 @@ class BatchedToken2Wav(nn.Module):
             )
             conditional, unconditional = estimate.split(batch_size, dim=0)
             velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
-            x = x + dt * velocity
-            time = time + dt
-            if step + 1 < self.n_timesteps:
-                dt = timeline[step + 2] - time[0]
+            # Trajectory jump (TJS): the CFM loop is an Euler integration of
+            # the flow-matching ODE dx/dt = v(x, t). Near t -> 1 the velocity
+            # field is close to constant, so the remaining steps contribute
+            # approximately (1 - t_stop) * v_stop. Jump there directly with a
+            # first-order extrapolation and skip the remaining estimator
+            # forwards. The skipped steps still append the last cache state:
+            # downstream code slices the stacked cache per step
+            # (cnn_cache[step]), so the stacked length must stay n_timesteps.
+            if 0 < self.jump_steps <= step + 1 < self.n_timesteps:
+                remaining = 1.0 - float(times[step][0])
+                x = x + remaining * velocity
+                for _ in range(step + 1, self.n_timesteps):
+                    next_cnn.append(step_cnn)
+                    next_att.append(step_att)
+                break
+            x = x + dts[step] * velocity
             next_cnn.append(step_cnn)
             next_att.append(step_att)
         return x, torch.stack(next_cnn), torch.stack(next_att)

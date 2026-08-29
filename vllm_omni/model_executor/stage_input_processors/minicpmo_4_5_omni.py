@@ -141,6 +141,58 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
     return chunk_frames, left_context_frames
 
 
+def _initial_chunk_frames(transfer_manager: Any, chunk_frames: int, request: Any = None) -> int:
+    """Optional smaller first-chunk threshold for fast first audio.
+
+    Read once from connector extra config ``initial_codec_chunk_frames``
+    (mirrors the qwen3_tts / cosyvoice3 / fish_speech processors). Values
+    <= 0 disable the feature (first chunk uses the steady ``chunk_frames``
+    threshold, i.e. upstream default behaviour). The value is clamped to
+    (0, chunk_frames]: a value >= chunk_frames would only add latency.
+
+    Per-request override: the API layer routes
+    ``initial_codec_chunk_frames`` through tts_params (additional_information)
+    to enable the fast first chunk for streaming requests only and explicitly
+    disable it (0) for non-streaming ones, where an extra small decode only
+    costs throughput without any latency benefit.
+    """
+    if request is not None:
+        request_info = getattr(request, "additional_information", None)
+        entry = None
+        if isinstance(request_info, Mapping):
+            entry = request_info.get("initial_codec_chunk_frames")
+        elif hasattr(request_info, "entries"):
+            entry = request_info.entries.get("initial_codec_chunk_frames")
+        if entry is not None:
+            try:
+                if hasattr(entry, "list_data") and entry.list_data is not None:
+                    value = entry.list_data[0] if len(entry.list_data) else None
+                elif isinstance(entry, (list, tuple)):
+                    value = entry[0] if len(entry) else None
+                else:
+                    value = entry
+                per_request = int(value) if value is not None else -1
+            except (TypeError, ValueError, IndexError):
+                per_request = -1
+            if per_request >= 0:
+                return per_request if 0 < per_request < chunk_frames else 0
+    cached = getattr(transfer_manager, "_minicpmo45_initial_chunk_frames", None)
+    if cached is not None:
+        return cached
+    connector = getattr(transfer_manager, "connector", None)
+    raw_config = getattr(connector, "config", {}) or {}
+    config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+    config = config if isinstance(config, dict) else {}
+    try:
+        initial = int(config.get("initial_codec_chunk_frames") or 0)
+    except (TypeError, ValueError):
+        initial = 0
+    if initial <= 0 or initial >= chunk_frames:
+        initial = 0
+    transfer_manager._minicpmo45_initial_chunk_frames = initial
+    return initial
+
+
 def _codec_scalars(value: Any) -> list[int]:
     """Normalize one request-routed codec delta to CPU scalar token IDs."""
     if value is None:
@@ -292,13 +344,25 @@ def tts2code2wav_async_chunk(
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    if not flush_pending and len(pending) < chunk_frames:
+    # Fast first audio: for the very first chunk of a request, an optional
+    # smaller threshold (initial_codec_chunk_frames) fires the first
+    # stage2 decode earlier, cutting TTFB at the cost of one extra small
+    # chunk. Steady-state chunks keep the full chunk_frames threshold.
+    effective_chunk_frames = chunk_frames
+    if (
+        not flush_pending
+        and int(state["codec_end"]) == 0
+    ):
+        initial_frames = _initial_chunk_frames(transfer_manager, chunk_frames, request)
+        if initial_frames > 0:
+            effective_chunk_frames = initial_frames
+    if not flush_pending and len(pending) < effective_chunk_frames:
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else effective_chunk_frames)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -671,6 +735,31 @@ def _build_tts_scheduler_prompt_token_ids(
     raise ValueError("MiniCPM-o TTS stage requires at least one scheduler prompt token")
 
 
+# API-routed TTS overrides that stage 1's output-boundary processor reads.
+# Kept explicit so forwarding stays cheap (scalars only) and new API fields
+# must consciously opt in rather than leaking onto every stage-1 request.
+_STAGE1_TTS_OVERRIDE_KEYS = ("initial_codec_chunk_frames",)
+
+
+def _forward_stage1_tts_overrides(prompt: Any) -> dict[str, Any] | None:
+    """Whitelist-copy per-request TTS overrides from the API prompt dict.
+
+    The API layer (serving_speech) routes streaming-vs-non-streaming
+    ``initial_codec_chunk_frames`` decisions through
+    ``prompt["additional_information"]``. That payload is attached to the
+    stage-0 request only; stage 1 receives whatever this module forwards in
+    the OmniTokensPrompt. Return ``None`` when nothing relevant is present so
+    the orchestrator skips payload serialization entirely.
+    """
+    if not isinstance(prompt, Mapping):
+        return None
+    info = prompt.get("additional_information")
+    if not isinstance(info, Mapping):
+        return None
+    forwarded = {key: info[key] for key in _STAGE1_TTS_OVERRIDE_KEYS if key in info}
+    return forwarded or None
+
+
 def llm2tts(
     source_outputs,
     prompt: OmniTokensPrompt | TextPrompt = None,
@@ -962,6 +1051,18 @@ def llm2tts(
             OmniTokensPrompt(
                 prompt_token_ids=scheduler_prompt_token_ids,
                 model_intermediate_buffer=model_intermediate_buffer,
+                # Forward API-routed per-request TTS overrides to stage 1 so
+                # the talker's output-boundary processor
+                # (tts2code2wav_async_chunk) can read them off its own
+                # Request. The orchestrator serializes this dict into the
+                # stage-1 EngineCoreRequest (``_upgrade_processed_stage_request``)
+                # and the scheduler restores it onto the live Request, where
+                # ``_initial_chunk_frames`` looks it up. Whitelist keys rather
+                # than forwarding everything: the API payload can carry heavy
+                # tensors (ref_audio waveforms) that stage 0 needs but the
+                # talker never reads, and duplicating them per chunk costs
+                # shared-memory bandwidth.
+                additional_information=_forward_stage1_tts_overrides(p),
                 multi_modal_data=(
                     multi_modal_data[llm_output.request_id]
                     if requires_multimodal_data and multi_modal_data.get(llm_output.request_id) is not None

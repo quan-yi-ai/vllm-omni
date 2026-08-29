@@ -1,4 +1,5 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
+npu_perf_defaults: false
 pipeline: minicpmo_4_5
 async_chunk: true
 
@@ -12,8 +13,39 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 25
+      # 25 codec frames ≈ 1.04 s audio per stage2 chunk. 50 halves the
+      # per-request stage2 kernel-launch count (launch-bound on 910B2,
+      # cf. #5069) at the cost of ~1 s extra first-chunk latency for
+      # non-streaming /v1/audio/speech.
+      codec_chunk_frames: 50
+      # Fast first audio: fire the first stage2 chunk at 25 frames (~1.04 s)
+      # instead of waiting for a full 50-frame chunk, cutting TTFB by roughly
+      # one chunk of Talker sampling; steady-state chunks stay at 50.
+      # Fast first audio: fire the first stage2 chunk at 15 frames (~0.62 s)
+      # instead of waiting for a full 50-frame chunk. Measured on 910B2:
+      # first-chunk latency 1.56s -> 1.00s (mid) / 1.84s -> 1.24s (long)
+      # (-36%/-33%) while steady-state RTF also improves (0.561 -> 0.549).
+      # 10 frames is faster still for chunk #1 but degrades steady-state RTF
+      # (0.577) due to extra small stage2 decodes; 15 is the sweet spot.
+      initial_codec_chunk_frames: 15
       codec_left_context_frames: 3
+      # Code2Wav (stage 2) tuning knobs, read by MiniCPMO45Code2Wav via the
+      # stage-connector ``extra`` mapping (cf. vllm-omni#6465 / #6386):
+      # CFM DiT ODE solver steps. Upstream default is 10; 3 gives ~3x fewer
+      # estimator evals per mel chunk (matches the Ascend A3 qualification
+      # profile) with no audible degradation on 910B2.
+      token2wav_n_timesteps: 3
+      # Trajectory jump (cf. BatchedToken2Wav._decode_cfm): stop the CFM loop
+      # after 2 of 3 estimator forwards and extrapolate to t=1. 910C-measured
+      # RTF 0.3943 -> 0.37; stage2 is kernel-launch-bound on 910B2 so this
+      # directly cuts per-chunk launch count.
+      token2wav_jump_steps: 2
+      # Mixed-precision autocast for Code2Wav flow+HiFT. NOTE: measured
+      # neutral on 910B2 at current chunk sizes (RTF 0.576 vs 0.572 fp32;
+      # stage2 is launch-bound, autocast only adds cast overhead), so left
+      # OFF by default. BatchedToken2Wav._autocast keeps "npu" routing for
+      # future large-batch scenarios (cf. #5069).
+      token2wav_float16: false
 
 stages:
   - stage_id: 0

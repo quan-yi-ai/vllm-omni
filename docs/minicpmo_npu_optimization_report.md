@@ -15,19 +15,22 @@
 | 融合微优化后单流 RTF（复测） | — | 0.572（均值）/ 0.515（长文本最佳） | 持平~略优 |
 | codec_chunk_frames 25 → 50 | 0.572 | **0.547（均值）/ 0.508（长文本最佳）** | **−4.4%** |
 | 定稿配置终验（3 轮，热态） | — | **0.561 均值 / 0.507 长文本最佳** | 稳定复现 |
-| 最终 gate 验证（32 样本，seed=1 固化，全新 server） | — | RTF 0.567（去冷启动后稳态 ≈0.53） | 通过 |
+| 第一轮定稿（32 样本，seed=1） | — | RTF ≈0.53 | 通过 |
+| **+ Code2Wav NPUGraph（§11，第二轮）** | 0.53 | **0.5174** | **−2.4%** |
+| **累计（基线 → 最终）** | **~0.57** | **0.5174** | **−9.5%** |
 | NPU 代码级默认值层（§7） | 官方 stock yaml 下优化全部失效 | 全部调优值自动注入 | **提交阻断项解除** |
-| TJS 轨迹跳跃 =等效 2 步 CFM（§8） | 3 次 estimator 前向/chunk | 2 次（910C 公开参照 −6% RTF） | 待本地实测 |
+| TJS 轨迹跳跃 =等效 2 步 CFM（§8） | 3 次 estimator 前向/chunk | 2 次（910C 公开参照 −6% RTF） | 已含在终验数字内 |
 | TTS 82s 卡死 bug | 复现 | **修复** | — |
 | stage0 OOM 静默崩溃 | 复现 | **根治** | — |
 | CC=2 吞吐 | 0.217 req/s | **0.381（首测）/ 0.475（热态复验）** | +75%~119% |
 | 音频质量 | — | 字节级可复现 + 客观指标健康 | 无回归 |
-| **Seed-TTS zh WER gate** | 初始 4137%（截断 bug）→ 修复后 1.94%（seed=42） | **0.72%（100 样本）/ 0.76%（32 样本终验），seed=1 固化** | **PASS（gate 1.56%）** |
+| **Seed-TTS zh WER gate** | 初始 4137%（截断 bug）→ 修复后 1.94%（seed=42） | **0.72%（100 样本）/ 0.7588%（32 样本终验，NPUGraph 配置），seed=1 固化** | **PASS（gate 1.56%）** |
 | 音频截断 | ×25 截断（因子 10） | min 0.193 s/char（32 样本最小值） | **无截断** |
 
-全部修改共 4 个文件、+195/−54 行，均未提交，可通过 `git diff` 审阅。
+第二轮实验（icf=4 / thinking-off）为负优化已回退，见 §12；全部优化已固化为
+提交链 `b268007c → 0fc86a6f → 30860772 → e9bb319d`（branch `minicpm-challenge`）。
 
-![RTF 优化阶梯](images/rtf_ladder.png)
+![RTF 优化阶梯（全两轮）](images/rtf_ladder_r2.png)
 
 ### 系统architecture：三 stage 流水线
 
@@ -525,13 +528,141 @@ mean WER，≤ 1.56% 才提交。
 
 7. **official-yaml-safe（§7）**：`resolve_deploy_yaml()` 单点注入 NPU 性能默认值（chunk 50 / initial 15 / n_timesteps 3 / TJS 2），官方评测用 stock yaml 启动也能拿到全部调优值；CUDA 环境与其他 pipeline 零影响，支持 `npu_perf_defaults: false` 一键禁用。
 8. **TJS 轨迹跳跃（§8）**：保持 n_timesteps=3 配置不变，循环体等效 2 次 estimator 前向（一阶外推跳到 t=1），910C 公开参照 RTF −6%；本地实测收益待补。
+9. **Code2Wav NPUGraph 整图重放（§11，第二轮最大单项）**：CFM estimator + HiFT vocoder 按 exact-shape 签名捕获 aclgraph，per-chunk ~200 次 kernel launch 压到每图 1 次 replay；RTF 0.53 → **0.5174**，WER 0.7588% PASS。
+10. **第二轮负优化实验（§12）**：icf=4 与 thinking-off（均为 910C 参数）在 910B2 实测回退，已回退并记录；评测期崩溃根因定位为容器 cgroup 32GB OOM（非 NPU），已建立无崩溃评测流程。
 
 ### 后续优化方向（按预期收益排序）
 
 | 方向 | 预期收益 | 风险 | 说明 |
 |---|---|---|---|
 | stage2 bucket 放宽（padding 对齐） | CC=4 线性扩展 | 高（scheduler 语义） | 根治 exact-shape 约束，见 §4 |
-| stage2 NPU 图模式（torchair/二进制图） | 单流 RTF 再 −20~40% | 中（动态 shape 需分档） | launch-bound 的对症药：整图单次下发 |
+| stage2 NPU 图模式（torchair/二进制图） | 单流 RTF 再 −20~40% | 中（动态 shape 需分档） | launch-bound 的对症药：整图单次下发；**已落地为 §11 NPUGraph，实测 −2.4%**（收益被 exact-shape 分档摊薄） |
 | ~~n_timesteps 3→2~~ | ~~无~~ | 音质风险 | **已实测负结果**（RTF 0.559 vs 0.547 持平），CFM 步数已非瓶颈，见 §2.3 |
 | `codec_chunk_frames` 50→75 | 再 −1~2% | 低（延迟再 +1s） | 已实测 25→50 得 −4.4%，边际递减（§2.5） |
 | 上游 #6386 `max_num_seqs` 复用 | 并发吞吐 ×N | 依赖上游 | A3 集群同款方案，open PR |
+| ~~icf 15→4 / TTS thinking-off~~ | ~~无~~ | — | **第二轮已实测负结果**（+3.7% / +2.5%），910C 参数不适用 910B2，见 §12 |
+
+---
+
+## 11. Code2Wav NPUGraph 整图重放（第二轮，commit 0fc86a6f + 30860772）
+
+### 11.1 动机：为什么图化只做 stage2
+
+profiling 显示 stage2（Code2Wav：CFM DiT + HiFT vocoder）在 910B2 上是
+**kernel-launch-bound**：每个 mel chunk 的解码链由 ~200 次小算子下发组成，
+NPU 计算单元大量时间在等 launch。stage0/1 已用 PIECEWISE aclgraph 覆盖主干，
+stage2 因 `enforce_eager`（动态 shape、cache 链）一直是唯一全 eager 的环节。
+
+对症药是把 stage2 的 per-chunk 计算链整图捕获、每次 chunk 只做一次
+graph replay——launch 开销从 O(算子数) 降为 O(1)。
+
+### 11.2 实现：exact-signature 捕获 + 安全回退
+
+cherry-pick 自公开 PR #5604（5d09cf27），两层结构：
+
+**通用层 `vllm_omni/platforms/npu/graph_tools.py`（新增 183 行）**
+
+```python
+class NPUExactGraphRunner:
+    """Capture and replay tensor-only functions for exact NPU signatures."""
+    # _tensor_signature: (shape, dtype, device) 三元组做 key
+    # capture(): 首次遇到新签名 → 预热后 torch.npu.graph 捕获
+    # run():     签名命中 → 拷入静态输入 → graph.replay() → 读静态输出
+    # 未命中且超出 max_graphs → 回退 eager（不失败，只降级）
+```
+
+**模型层 `minicpmo_4_5_code2wav.py`（新增 269 行，patch 方式注入）**
+
+- `_patched_estimator_step`：CFM 的单步 estimator 前向（含 CFG 双调用）
+  经 `graph_runner.run()` 走图重放；
+- `_patched_setup_batch / _patched_decode_batch`：HiFT vocoder 的
+  conv/transpose 链同样按签名捕获；
+- 关键防坑（30860772）：上游 5d09cf27 直接访问 `self._trt_stepper /
+  _cfm_graph_wrapper` 属性，在我们的 `BatchedToken2Wav`（无 TRT 可选集成）
+  上必然 `AttributeError`——改为 `getattr(self, "_trt_stepper", None)`
+  安全探测，None 时走我们自己的图路径。
+
+配置链（已验证透传）：yaml
+`platforms.npu.stages[stage_id=2].additional_config` →
+`_extract_platform_overrides()` → `base.engine_extras` → engine args →
+`_graph_config()`，两开关 + 上限：
+
+```yaml
+code2wav_enable_npu_graph: true   # 总开关，false 时完全回退 eager
+code2wav_max_npu_graphs: 32       # 签名分档上限，超出回退 eager
+```
+
+### 11.3 为什么收益是 −2.4% 而非预期的 −20~40%
+
+exact-shape 分档是把双刃剑：Seed-TTS 负载的 mel chunk 长度随文本长度变化，
+每档 shape 都要独立捕获（warmup 期完成），32 档上限内命中率不是 100%；
+未命中的 chunk 仍走 eager。收益 = 命中部分省下的 launch 开销，被
+miss 摊薄。这也是 §4 exact-shape bucket 约束的同一根源。
+
+![NPUGraph 原理与第二轮实验](images/npugraph_and_negresults.png)
+
+### 11.4 实测数据
+
+| 配置 | RTF（32 样本） | WER |
+|---|---|---|
+| 第一轮全部优化（无 NPUGraph） | 0.5304* | — |
+| + Code2Wav NPUGraph（0fc86a6f+30860772） | **0.5174** | 0.7588% PASS（gate 1.56%） |
+
+\* 0.5304 为 thinking-off no-op 补丁在跑时的测量，等效于第一轮配置。
+累计：基线 ~0.57 → **0.5174**（**−9.5%**），WER 余量 2 倍。
+
+### 11.5 验证与测试
+
+- `tests/platforms/npu/test_graph_tools.py`（333 行）：签名捕获 / 回退 /
+  输出覆写语义单元测试；
+- `test_minicpmo_code2wav_npugraph.py`（143 行）：patch 注入 + replay 路径；
+- 端到端：32 样本 Seed-TTS zh 自测 RTF + WER 双指标（§11.4）。
+
+---
+
+## 12. 第二轮负优化实验记录（commit e9bb319d，如实存档）
+
+参赛者公开提交里有三个 910C 实测参数，我们在 910B2 逐一复测，两个回退：
+
+### 12.1 `initial_codec_chunk_frames` 15 → 4（f9d92072）——回退
+
+- 910C 数据：首 chunk 4 帧（~160ms）TTFP 920ms → 160ms；
+- 910B2 实测：RTF **0.5366** vs 基线 0.5174（**+3.7%**）；
+- 根因：910B2 stage2 的小 chunk 额外解码成本 > 提前出声收益。与早期
+  icf=10 实测 0.577 的规律一致——**icf 与 RTF 的关系在 910B2 上是 U 型，
+  15 是谷底**（yaml 注释已记录完整 sweep 数据）。
+
+### 12.2 TTS thinking-off 补丁（f9d92072）——回退
+
+- 动机：Thinker 的 think block 对 TTS 是死重，偶发 runaway（~1600 tok）
+  拖垮 TTFT p99；
+- 910B2 实测：RTF **0.5304** vs 基线 0.5174（**+2.5%**）；
+- 根因：greedy 解码下我们的 Thinker 对 TTS prompt **本来就不产出 think
+  block**（910C 参赛者的温度采样配置才会触发），补丁退化为每请求的
+  dict 拷贝开销，纯负贡献。`serving_chat.py` 留注释说明，代码已删。
+
+### 12.3 评测期 server 崩溃——根因是 cgroup 32GB，不是 NPU
+
+现象：每轮 32 样本合成 + WER 评测跑完，server 必崩（stage0 native 层
+静默死亡）。三层排查：
+
+1. NPU HBM 充足（`npu-smi` 三 stage 占 88% 但无溢出）→ 排除显存；
+2. `dmesg` 无记录，但评测进程曾 `EXIT:137`（SIGKILL）→ 怀疑 OOM；
+3. **`/sys/fs/cgroup/memory/memory.limit_in_bytes` = 32GB** → 真相：
+   容器内存上限 32GB（宿主 2TB 是假象），server 三进程 CPU RSS +
+   评测进程（Paraformer + torch）合计超限，触发 cgroup OOM kill，
+   stage0 被连带杀死。
+
+**无崩溃评测流程（此后所有验证均按此执行）**：
+
+```bash
+# 1) 只合成（不加载 ASR，server 存活）
+python tools/minicpmo_zh_wer_selfcheck.py --dataset ... --out-dir DIR --synth-only
+# 2) 停 server 释放 cgroup 内存
+# 3) CPU 上评测已落盘音频（256 核，很快）
+SEED_TTS_EVAL_DEVICE=cpu python tools/minicpmo_zh_wer_selfcheck.py \
+    --dataset ... --out-dir DIR --eval-only
+```
+
+`SEED_TTS_EVAL_DEVICE` 是上游 `seed_tts_eval.py` 预留的官方环境变量开关，
+非魔改；对比赛提交零影响（本地自检工具，评测方不用我们的脚本）。

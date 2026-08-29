@@ -107,7 +107,14 @@ def _patched_estimator_step(
 ):
     assert _original_estimator_step is not None
     graph_runner = _backend_graph_runners.get(self)
-    if graph_runner is None or self._trt_stepper is not None or self._cfm_graph_wrapper is not None:
+    # _trt_stepper / _cfm_graph_wrapper are optional upstream TRT/CFM graph
+    # integrations; treat missing attributes as "not in use" so the exact-shape
+    # NPU graph path stays eligible.
+    if (
+        graph_runner is None
+        or getattr(self, "_trt_stepper", None) is not None
+        or getattr(self, "_cfm_graph_wrapper", None) is not None
+    ):
         return _original_estimator_step(
             self,
             estimator,

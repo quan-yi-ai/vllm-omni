@@ -22,11 +22,11 @@ connectors:
       # instead of waiting for a full 50-frame chunk, cutting TTFB by roughly
       # one chunk of Talker sampling; steady-state chunks stay at 50.
       # Fast first audio: fire the first stage2 chunk at 15 frames (~0.62 s)
-      # instead of waiting for a full 50-frame chunk. Measured on 910B2:
-      # first-chunk latency 1.56s -> 1.00s (mid) / 1.84s -> 1.24s (long)
-      # (-36%/-33%) while steady-state RTF also improves (0.561 -> 0.549).
-      # 10 frames is faster still for chunk #1 but degrades steady-state RTF
-      # (0.577) due to extra small stage2 decodes; 15 is the sweet spot.
+      # instead of a full 50-frame chunk. Measured on 910B2: first-chunk
+      # latency 1.56s -> 1.00s (mid) / 1.84s -> 1.24s (long); steady-state
+      # RTF 0.549. icf=4 (910C param, f9d92072) retested 2026-08-29 with
+      # NPUGraph on: RTF 0.5366 vs 0.5174 -> regression; 10 frames was 0.577.
+      # 15 remains the 910B2 sweet spot even with stage2 graphed.
       initial_codec_chunk_frames: 15
       codec_left_context_frames: 3
       # Code2Wav (stage 2) tuning knobs, read by MiniCPMO45Code2Wav via the

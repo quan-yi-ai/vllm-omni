@@ -545,6 +545,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if self._diffusion_mode:
             return await self._create_diffusion_chat_completion(request, raw_request)
 
+        # NOTE: a thinking-off default for audio-output requests was trialed
+        # (f9d92072 port, 2026-08-29) and reverted: on 910B2 the Thinker emits
+        # no think block for TTS prompts under greedy decoding, so the patch
+        # only added per-request dict churn -- measured RTF 0.5304 vs 0.5174
+        # baseline (+2.5%, within run noise but never faster). Revisit only
+        # if TTFT p99 runaway (~1600-tok think blocks) shows up in logs.
+
         request_timestamp = time.time()
         if raw_request is not None:
             request_timestamp = float(getattr(raw_request.state, "request_timestamp", request_timestamp))

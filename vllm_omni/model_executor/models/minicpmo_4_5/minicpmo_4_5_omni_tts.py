@@ -11,10 +11,10 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
+import json
+import os
 from collections.abc import Iterable
 from typing import Any
-
-import json
 
 import torch
 import torch.nn as nn
@@ -58,16 +58,27 @@ _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 # Example /tmp/codec_override.json: {"seed": 43, "temperature": 0.7}
 _CODEC_OVERRIDE_PATH = "/tmp/codec_override.json"
 
+# (mtime_ns, size, parsed_dict) of the last successfully loaded override
+# file. Codec sampling calls _codec_overrides() every decode step, so the
+# file is re-parsed only when its mtime/size changes (hot-tunable without
+# a restart, ~free in the steady state).
+_codec_override_cache: tuple[int, int, dict] | None = None
+
 
 def _codec_overrides() -> dict:
-    """Load optional codec sampling overrides from _CODEC_OVERRIDE_PATH."""
-    import os
-
+    """Load codec sampling overrides, cached on file (mtime, size)."""
+    global _codec_override_cache
     path = os.environ.get("CODEC_OVERRIDE_PATH", _CODEC_OVERRIDE_PATH)
     try:
+        stat = os.stat(path)
+        cached = _codec_override_cache
+        if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2]
         with open(path) as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        data = data if isinstance(data, dict) else {}
+        _codec_override_cache = (stat.st_mtime_ns, stat.st_size, data)
+        return data
     except (OSError, ValueError):
         return {}
 
@@ -359,7 +370,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "max_tokens": max_tokens,
                 "min_tokens": min_tokens,
                 "finished": empty_condition,
-                "condition_tokens": int(token_ids.numel()),
             }
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
@@ -397,8 +407,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         generator = self._request_generators.get(request_id)
         if generator is None:
             generator = torch.Generator(device=device)
-            ov = _codec_overrides()
-            generator.manual_seed(int(ov.get("seed", self._codec_seed)))
+            generator.manual_seed(int(_codec_overrides().get("seed", self._codec_seed)))
             self._request_generators[request_id] = generator
         return generator
 
@@ -409,8 +418,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
     ) -> torch.Tensor:
-        ov = _codec_overrides()
-        temperature = float(ov.get("temperature", self._codec_temperature))
+        temperature = float(_codec_overrides().get("temperature", self._codec_temperature))
         logits = self.head_code[0](hidden_state).float() / temperature
         eos_id = self._codec_eos_id
         logits = _apply_repetition_penalty(
@@ -429,10 +437,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # NOTE: upstream MiniCPMTTS.generate_chunk() builds TopP/TopK warpers
         # via gen_logits() but never applies them -- codec sampling is plain
         # temperature + repetition-penalized multinomial. Applying top_k here
-        # permanently filters the low-ranked EOS token (id 625, typically
-        # ranked ~5875/6562) so it can never be drawn and every request runs
-        # to the 2048-token cap (82 s of silence-padded audio). Match upstream
-        # and skip nucleus/top-k filtering entirely.
+        # permanently filters the low-ranked codec EOS (typically ranked
+        # ~5875/6562 under top_k=25) so it can never be drawn and every
+        # request runs to the 2048-token cap (82 s of silence-padded audio).
+        # Match upstream and skip nucleus/top-k filtering entirely.
         probabilities = torch.softmax(logits, dim=-1)
         return torch.multinomial(
             probabilities,

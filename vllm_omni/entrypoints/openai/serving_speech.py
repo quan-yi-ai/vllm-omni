@@ -783,20 +783,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 AutoTokenizer.from_pretrained, model_path, trust_remote_code=True
             )
 
-        voice = request.voice or ""
         system_prompt = self._MINICPMO45_AUDIO_ASSISTANT_PROMPT
-        # Voice selection: <reserved_53> is the default timbre token; swap it
-        # when the caller passes an explicit voice name.
-        reserved = self._minicpmo45_tokenizer.convert_tokens_to_ids("<reserved_53>")
-        if voice and reserved is not None:
-            voice_ids = [
+        # Voice selection: callers may pass a timbre token id (the
+        # checkpoint exposes <reserved_52>..<reserved_66>; 53 is the default
+        # baked into the system prompt above). Swap the token when the value
+        # is a valid id; anything else (e.g. OpenAI-style voice names such as
+        # "alloy") falls back to the default timbre.
+        voice_token = str(request.voice or "").strip()
+        if voice_token.isdigit():
+            voice_id = int(voice_token)
+            valid_ids = {
                 self._minicpmo45_tokenizer.convert_tokens_to_ids(f"<reserved_{i}>")
                 for i in range(52, 67)
-            ]
-            if voice in voice_ids:
-                system_prompt = system_prompt.replace(
-                    f"<{reserved}>", f"<{voice}>", 1
-                )
+            }
+            if voice_id in valid_ids:
+                default_id = self._minicpmo45_tokenizer.convert_tokens_to_ids("<reserved_53>")
+                if default_id is not None:
+                    system_prompt = system_prompt.replace(
+                        f"<{default_id}>", f"<{voice_id}>", 1
+                    )
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": request.input},

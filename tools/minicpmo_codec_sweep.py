@@ -50,10 +50,10 @@ def main() -> int:
 
     print(f"{'seed':>6} {'temp':>5} | " + " | ".join(f"idx{i:02d} wer" for i, _ in samples))
     for seed in args.seeds:
-        ov: dict = {"seed": seed}
+        overrides: dict = {"seed": seed}
         if args.temperature is not None:
-            ov["temperature"] = args.temperature
-        OVERRIDE_PATH.write_text(json.dumps(ov))
+            overrides["temperature"] = args.temperature
+        OVERRIDE_PATH.write_text(json.dumps(overrides))
         wers = []
         for i, (utt, ref_text, ref_wav, target) in samples:
             wav_name = f"seed{seed}_idx{i:02d}.wav"

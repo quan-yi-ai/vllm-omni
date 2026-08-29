@@ -234,8 +234,6 @@ def _patched_build_backend(self) -> None:
         if self.backend.flow.training:
             raise ValueError("MiniCPM-o Code2Wav NPUGraph capture requires flow.eval()")
         _backend_graph_runners[self.backend] = graph_runner
-
-    if graph_enabled:
         logger.info(
             "MiniCPM-o Code2Wav NPUGraph replay enabled (max_graphs=%d)",
             max_graphs,

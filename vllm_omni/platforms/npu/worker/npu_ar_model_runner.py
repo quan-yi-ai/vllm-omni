@@ -510,7 +510,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         overrides. All knobs are runner-side only; K=1 (default) disables the
         feature entirely and the code paths below are inert.
         """
-        self._talker_local_steps = 8
+        # K=12 mirrors the scheduler-side defaults (_k / sched_k = 12 in
+        # omni_ar_scheduler.py) and the master's submitted tree
+        # (origin/submit 62f4e4ab). The local "clean tree" commit ea66d2d2
+        # accidentally reverted this to 8, leaving scheduler=12 / runner=8
+        # mismatched: the scheduler bumps each bootstrap window to 12 while
+        # the runner only executes 8 local steps, so num_computed_tokens
+        # runs 4 ahead of the KV actually written and the stage-1 engine
+        # eventually hits `assert num_tokens_scheduled > 0` (seen as a
+        # warmup-time crash on 2026-08-30). Keep both sides at 12.
+        self._talker_local_steps = 12
         self._talker_local_stage_id: int | None = 1
         self._talker_cpu_slot_mapping = True
         self._talker_binary_argmax = True

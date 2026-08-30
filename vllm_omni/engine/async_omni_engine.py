@@ -30,6 +30,24 @@ def _w4_full_chain_prewarm(port: int) -> None:
     import urllib.request
 
     logger = logging.getLogger("vllm_omni.w4_prewarm")
+
+    def _resolve_served_model() -> str | None:
+        """Resolve the served model name via /v1/models so prewarm works
+        regardless of whether the server was launched with an HF id or a
+        local checkpoint path (hardcoded "openbmb/MiniCPM-o-4_5" 404s when
+        the server serves the path form)."""
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v1/models", timeout=30
+            ) as resp:
+                _models = _json.loads(resp.read()).get("data") or []
+            for _m in _models:
+                _mid = _m.get("id")
+                if _mid:
+                    return _mid
+        except Exception:
+            pass
+        return None
     try:
         _bodies = [
             # prewarm v6: cover eval 13-33 char distribution (zh meta.lst
@@ -60,8 +78,13 @@ def _w4_full_chain_prewarm(port: int) -> None:
             {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好好好好好好好", "max_tokens": 256},
         ]
 
+        _served = _resolve_served_model()
+        if _served is None:
+            raise RuntimeError(
+                "W4 prewarm could not resolve served model from /v1/models"
+            )
         body = {
-            "model": "openbmb/MiniCPM-o-4_5",
+            "model": _served,
             "messages": [
                 {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
                 {"role": "user", "content": [{"type": "text", "text": _bodies[0]["text"]}]},

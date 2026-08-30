@@ -183,9 +183,16 @@ HF_ENDPOINT=https://hf-mirror.com SEED_TTS_SIM_EVAL=1 vllm bench serve --omni \
 
 ## 4. 已知事项
 
-1. **W4 预热生效需重启**：当前运行中服务是修复前代码起的（预热 404 已知），
-   但 40 条 r2 热态数据表明图缓存在 bench 的 num-warmups=2 下也已覆盖，
-   全量数字不受影响；下次重启后 W4 将真正生效（消除 boot 态首 run 方差）。
+1. **W4 预热已验证生效且不污染稳态**（2026-08-30 20:12 UTC 实测）：
+   重启服务后 `[W4-I03] full-chain prewarm done @19:45:38` 首次出现；
+   随后 40 条回归 E2EL 1005.26ms / RTF 0.22 / TTFP 348.11ms /
+   WER 0.0062 / SIM 0.8409，与 W4 前基线（994.96ms / 0.21 / 339.35ms /
+   0.0062 / 0.8408）一致——预热收益只作用于 boot 态首请求，
+   稳态无损。证据：`docs/v2_w4_prewarm_bench40.log`。
+   复现命令在 §3.2 基础上加
+   `--extra-body '{"modalities":["text","audio"],"chat_template_kwargs":{"enable_thinking":false,"use_tts_template":true}}'`
+   （注意：不带此参数 thinking 开启，E2EL 会虚高至 ~2919ms、WER 升至 1.88%，
+   那是配置错误不是回归）。
 2. **910B2 与 910C 配置差异是有意的**：`max_num_seqs 4 vs 8`、
    `enable_static_kernel false vs PIECEWISE` 均为 910B2 内存/编译器约束的
    实测选择（8 并发 OOM、static kernel 崩 TBE），非遗漏。

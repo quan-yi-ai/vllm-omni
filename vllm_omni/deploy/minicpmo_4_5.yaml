@@ -90,9 +90,15 @@ platforms:
     stages:
     - stage_id: 0
       max_num_batched_tokens: 8192
-      compilation_config:
-        cudagraph_mode: PIECEWISE
+      additional_config:
+        ascend_compilation_config:
+          # 910B2: static-kernel compilation crashed TBE (task_distribute
+          # ERR) during stage graph capture on 2026-08-30; the master's
+          # v8.2 values were tuned on 910C. Keep npugraph_ex, drop the
+          # static-kernel compile step.
+          enable_static_kernel: false
     - stage_id: 1
       max_num_batched_tokens: 8192
-      compilation_config:
-        cudagraph_mode: PIECEWISE
+      additional_config:
+        ascend_compilation_config:
+          enable_static_kernel: false

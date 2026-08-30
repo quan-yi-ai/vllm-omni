@@ -1701,8 +1701,22 @@ async def _w4_full_chain_prewarm(app_state) -> None:
         port = getattr(app_state, "server_port", None)
         if not port:
             port = 8094
+        # Resolve the served model dynamically: health-triggered prewarm runs
+        # after Uvicorn is listening, so /v1/models works here. A hardcoded
+        # HF id 404s when the server was launched with a local checkpoint path.
+        _model = "openbmb/MiniCPM-o-4_5"
+        try:
+            import json as _json
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v1/models", timeout=30
+            ) as _resp:
+                _models = _json.loads(_resp.read()).get("data") or []
+            if _models and _models[0].get("id"):
+                _model = _models[0]["id"]
+        except Exception:
+            pass
         body = {
-            "model": "openbmb/MiniCPM-o-4_5",
+            "model": _model,
             "messages": [
                 {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
                 {"role": "user", "content": [{"type": "text", "text": "你好"}]},

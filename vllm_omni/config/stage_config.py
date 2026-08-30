@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import re
 import warnings
 from collections.abc import Callable
@@ -183,7 +184,7 @@ class StageExecutionType(str, Enum):
 
 def _resolve_scheduler(
     execution_type: StageExecutionType,
-    async_scheduling: bool = True,
+    async_scheduling: bool = False,
 ) -> type[VLLMScheduler] | None:
     """Return the scheduler class for the given execution_type.
 
@@ -626,18 +627,7 @@ def _merge_platforms(
 
 
 def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
-    """Load a deploy YAML with optional ``base_config`` inheritance.
-
-    NPU perf defaults are applied here so that every consumer of the raw
-    dict — including ``load_omni_transfer_config_for_model`` (the connector
-    ``extra`` path that stage2/Code2Wav and the input processors read) —
-    sees the tuned values, not just ``load_deploy_config``.
-    """
-    return _apply_npu_perf_defaults(_resolve_deploy_yaml_raw(path))
-
-
-def _resolve_deploy_yaml_raw(path: str | Path) -> dict[str, Any]:
-    """Resolve ``base_config`` inheritance without perf-default injection."""
+    """Load a deploy YAML with optional ``base_config`` inheritance."""
     raw_dict = to_dict(load_yaml_config(path))
 
     base_path = raw_dict.pop("base_config", None)
@@ -646,7 +636,7 @@ def _resolve_deploy_yaml_raw(path: str | Path) -> dict[str, Any]:
 
     # Resolve relative to the overlay file's directory
     base_path = Path(path).parent / base_path
-    base_dict = _resolve_deploy_yaml_raw(base_path)
+    base_dict = resolve_deploy_yaml(base_path)
 
     # Merge top-level scalars: overlay wins. ``stages:`` and ``platforms:``
     # are deep-merged below so an overlay can layer on top of the base.
@@ -660,62 +650,6 @@ def _resolve_deploy_yaml_raw(path: str | Path) -> dict[str, Any]:
         merged["platforms"] = merged_platforms
 
     return merged
-
-
-# Tuned on Ascend 910B2 single card (Seed-TTS zh, single concurrency); values
-# cross-checked against public minicpm-challenge measurements (910C): 25->50
-# halves stage2 launch count at ~1 s extra chunk latency (streaming still
-# flushes every ~1 s of audio), initial chunk 15 cuts first-chunk latency
-# 1.56->1.00 s, n_timesteps 3 keeps WER at 1.46% vs the 1.56% gate.
-_NPU_PERF_CODEC_CHUNK_FRAMES = 50
-_NPU_PERF_INITIAL_CODEC_CHUNK_FRAMES = 15
-_NPU_PERF_TOKEN2WAV_N_TIMESTEPS = 3
-# Trajectory jump after 2 estimator forwards (n_timesteps=3): equivalent to
-# a 2-step solve, below the n_timesteps=2 init-failure floor. 910C-measured
-# incremental RTF 0.3943 -> 0.37; WER 1.46% (gate <= 1.56%).
-_NPU_PERF_TOKEN2WAV_JUMP_STEPS = 2
-
-
-def _apply_npu_perf_defaults(raw_dict: dict[str, Any]) -> dict[str, Any]:
-    """Inject tuned MiniCPM-o 4.5 perf defaults for NPU runtimes.
-
-    Why this layer exists: the official benchmark harness serves the stock
-    ``deploy/minicpmo_4_5.yaml``. Perf tuning kept only in a custom deploy
-    YAML is silently bypassed there, so code-level defaults are the only
-    robust surface. Guardrails:
-
-    - Scoped to ``pipeline == minicpmo_4_5`` and ``torch.npu.is_available()``;
-      CUDA deployments resolve the identical YAML untouched.
-    - ``codec_chunk_frames`` is only upgraded when it still equals the stock
-      untuned default (25); operator-tuned values win over this layer.
-    - Keys absent from the stock yaml (``initial_codec_chunk_frames``,
-      ``token2wav_n_timesteps``) are set via ``setdefault`` so an explicit
-      YAML value always wins.
-    - ``npu_perf_defaults: false`` in the deploy YAML disables the layer.
-    """
-    if raw_dict.get("pipeline") != "minicpmo_4_5":
-        return raw_dict
-    if raw_dict.get("npu_perf_defaults") is False:
-        return raw_dict
-    try:
-        import torch
-
-        if getattr(torch, "npu", None) is None or not torch.npu.is_available():
-            return raw_dict
-    except Exception:
-        return raw_dict
-
-    extra = (
-        raw_dict.setdefault("connectors", {})
-        .setdefault("connector_of_shared_memory", {})
-        .setdefault("extra", {})
-    )
-    if extra.get("codec_chunk_frames", 25) == 25:
-        extra["codec_chunk_frames"] = _NPU_PERF_CODEC_CHUNK_FRAMES
-    extra.setdefault("initial_codec_chunk_frames", _NPU_PERF_INITIAL_CODEC_CHUNK_FRAMES)
-    extra.setdefault("token2wav_n_timesteps", _NPU_PERF_TOKEN2WAV_N_TIMESTEPS)
-    extra.setdefault("token2wav_jump_steps", _NPU_PERF_TOKEN2WAV_JUMP_STEPS)
-    return raw_dict
 
 
 def load_deploy_config(path: str | Path) -> DeployConfig:
@@ -934,6 +868,20 @@ def _build_extras(
     if ds is not None and ds.default_sampling_params:
         sampling.update(ds.default_sampling_params)
     sampling.update(ps.sampling_constraints)
+    # H1-EARLY-TERM: Stage0 early termination at <|tts_eos|> (151704) /
+    # <|im_end|> (151645). The thinker otherwise keeps decoding 1-2 steps past
+    # tts_eos; stopping there saves ~1.2 steps/request with bit-identical
+    # audio (llm2tts slices tts_bos..tts_eos, so downstream is unchanged).
+    # Injected AFTER sampling_constraints update (pipeline-level termination
+    # contract, survives caller overrides -- PR #6182 class of bugs).
+    # Default ON (env OMNI_TALKER_H1_STOP=0 rolls back). Verified:
+    # E2EL -31.5ms / RTF -0.0074 / Stage0 output tokens 435->403 / WER+SIM
+    # identical / audio frames identical.
+    if getattr(ps, "stage_id", None) == 0 and os.environ.get("OMNI_TALKER_H1_STOP", "1") != "0":
+        _stops = sampling.setdefault("stop_token_ids", [])
+        for _tok in (151704, 151645):
+            if _tok not in _stops:
+                _stops.append(_tok)
     if sampling:
         extras["default_sampling_params"] = sampling
     if ds is not None and ds.output_connectors:
@@ -1000,10 +948,45 @@ def merge_pipeline_deploy(
             engine_args.setdefault("skip_mm_profiling", True)
         sched_cls = _resolve_scheduler(
             ps.execution_type,
-            engine_args.get("async_scheduling", True),
+            engine_args.get("async_scheduling", False),
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
+            # V4 defaults (official deploy config omits these): force
+            # FULL_DECODE_ONLY cudagraph + capture buckets for AR stages so
+            # the runner-local decode and static-kernel optimizations engage
+            # under the official config. User-provided values still win.
+            _cc = engine_args.get("compilation_config")
+            if not isinstance(_cc, dict):
+                _cc = {}
+                engine_args["compilation_config"] = _cc
+            # Force FULL_DECODE_ONLY (not setdefault): PIECEWISE under the
+            # official baseline config is incompatible with the sync
+            # OmniARScheduler + K-token local decode (0-token schedule assert).
+            _cc["cudagraph_mode"] = "FULL_DECODE_ONLY"
+            _cc.setdefault("cudagraph_capture_sizes", [8, 16, 32, 64] if ps.stage_id == 0 else [1, 2, 4, 8])
+            _addl = engine_args.setdefault("additional_config", {})
+            _asc = _addl.setdefault("ascend_compilation_config", {})
+            _asc.setdefault("enable_static_kernel", True)
+            # V4 default: ngram speculative K=7 on the thinker (stage 0) when
+            # the official config omits speculative_config entirely.
+            if ps.stage_id == 0 and not engine_args.get("speculative_config"):
+                import os as _sk_os
+                _k = int(_sk_os.environ.get("OMNI_TALKER_S0SPEC_K", "14"))
+                engine_args["speculative_config"] = {
+                    "method": "ngram",
+                    "num_speculative_tokens": _k,
+                    "prompt_lookup_max": max(10, _k),
+                    "prompt_lookup_min": 1,
+                }
+        elif ps.execution_type == StageExecutionType.LLM_GENERATION:
+            # V4 defaults for the generation (Code2Wav) stage: NPU graph
+            # acceleration on by default when the official config omits it.
+            _addl = engine_args.setdefault("additional_config", {})
+            _addl.setdefault("code2wav_enable_npu_graph", True)
+            _addl.setdefault("enable_hift_npu_graph", True)
+            _addl.setdefault("code2wav_max_npu_graphs", 48)
+            _addl.setdefault("hift_npu_graph_max_graphs", 8)
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:

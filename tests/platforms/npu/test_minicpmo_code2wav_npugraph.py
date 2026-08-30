@@ -3,7 +3,6 @@
 """Ascend hardware validation for MiniCPM-o Code2Wav NPUGraph replay."""
 
 from math import prod
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -32,7 +31,8 @@ pytestmark = [
 class _Flow(nn.Module):
     def __init__(self, estimator: nn.Module):
         super().__init__()
-        self.decoder = SimpleNamespace(estimator=estimator)
+        self.decoder = nn.Module()
+        self.decoder.estimator = estimator
 
 
 class _Token2Wav:

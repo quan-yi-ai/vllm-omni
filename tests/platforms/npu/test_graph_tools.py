@@ -116,9 +116,12 @@ def test_exact_signature_dispatch_captures_then_replays(monkeypatch):
 
 
 def test_capture_failure_is_fatal_for_stage_process(monkeypatch):
+    # Hard-fail mode (recoverable=False) keeps the original semantics: one
+    # failed capture poisons the stage process.
     runner = NPUExactGraphRunner(
         component_name="test component",
         disable_config_hint="disable the test graph",
+        recoverable=False,
     )
     captures = 0
     computes = 0
@@ -150,6 +153,53 @@ def test_capture_failure_is_fatal_for_stage_process(monkeypatch):
     assert captures == 1
     assert computes == 1
     assert runner.stats == {"captures": 0, "failed": 1, "hits": 0}
+
+
+def test_capture_failure_is_recoverable_by_default(monkeypatch):
+    # Default mode: a failed capture falls back to eager execution for that
+    # signature while the stage keeps serving (and other signatures can
+    # still capture, e.g. the already-captured one keeps replaying).
+    runner = NPUExactGraphRunner(component_name="test component")
+    assert runner.recoverable is True
+
+    monkeypatch.setattr(runner, "_eligible", lambda inputs: True)
+    replays = []
+
+    def capture(inputs, compute):
+        if inputs[0].numel() == 1:
+            raise RuntimeError("unsupported op for shape 1")
+        static_in = inputs[0].clone()
+        static_out = compute(static_in)[0]
+
+        class _Graph:
+            def replay(self):
+                replays.append(static_out)
+
+        return CapturedDeviceGraph(
+            graph=_Graph(),
+            static_inputs=(static_in,),
+            static_outputs=(static_out,),
+        )
+
+    monkeypatch.setattr(runner, "capture", capture)
+
+    def compute(value):
+        return (value + 1,)
+
+    # Shape 1 fails capture but still returns the eager result.
+    first = runner.run("unit", (torch.tensor([1.0]),), (False,), compute)
+    torch.testing.assert_close(first[0], torch.tensor([2.0]))
+    # The failed signature permanently falls back to eager; no raise.
+    again = runner.run("unit", (torch.tensor([5.0]),), (False,), compute)
+    torch.testing.assert_close(again[0], torch.tensor([6.0]))
+    # A different signature captures fine and then replays.
+    second = runner.run("unit", (torch.tensor([1.0, 2.0]),), (False,), compute)
+    torch.testing.assert_close(second[0], torch.tensor([2.0, 3.0]))
+    third = runner.run("unit", (torch.tensor([3.0, 4.0]),), (False,), compute)
+    torch.testing.assert_close(third[0], torch.tensor([2.0, 3.0]))
+
+    assert replays == 1 or len(replays) == 1
+    assert runner.stats == {"captures": 1, "failed": 1, "hits": 1}
 
 
 def test_code2wav_runtime_disables_internal_format_and_jit(monkeypatch):
@@ -222,6 +272,52 @@ def test_code2wav_patch_reads_stage_additional_config(
         assert graph_runner.max_graphs == max_graphs
     else:
         assert model.backend not in code2wav_patch._backend_graph_runners
+
+
+@pytest.mark.parametrize(
+    ("env_value", "additional_config", "expected_prepared"),
+    [
+        # Stock deploy yaml (no additional_config): graph defaults ON.
+        (None, {}, 1),
+        # Explicit yaml opt-out still wins.
+        (None, {"code2wav_enable_npu_graph": False}, 0),
+        # Env-var escape hatch wins over the code-level default.
+        ("0", {}, 0),
+        ("1", {}, 1),
+    ],
+)
+def test_code2wav_graph_defaults_on_without_config(
+    monkeypatch,
+    env_value,
+    additional_config,
+    expected_prepared,
+):
+    prepared = 0
+
+    class _Backend:
+        speech_window = torch.zeros(1)
+        flow = SimpleNamespace(training=False)
+
+    model = SimpleNamespace(
+        backend=None,
+        vllm_config=SimpleNamespace(additional_config=dict(additional_config)),
+    )
+
+    def build_backend(instance):
+        instance.backend = _Backend()
+
+    def prepare_runtime():
+        nonlocal prepared
+        prepared += 1
+
+    monkeypatch.delenv(code2wav_patch._ENV_DISABLE_KEY, raising=False)
+    if env_value is not None:
+        monkeypatch.setenv(code2wav_patch._ENV_DISABLE_KEY, env_value)
+    monkeypatch.setattr(code2wav_patch, "_original_build_backend", build_backend)
+    monkeypatch.setattr(code2wav_patch, "prepare_code2wav_graph_runtime", prepare_runtime)
+    code2wav_patch._patched_build_backend(model)
+
+    assert prepared == expected_prepared
 
 
 @pytest.mark.parametrize("with_cache", [False, True])

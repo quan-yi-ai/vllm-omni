@@ -84,6 +84,55 @@ def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | No
     )
 
 
+
+def normalize_handoff_tensor(value: object) -> object:
+    """Rebuild a tensor from the tagged T44 handoff blob.
+
+    The T44 producer encodes CPU tensors as
+    ``{"__t44_tensor__": dtype, "shape": [...], "data": bytes}`` so the
+    EngineCoreRequest msgspec transport carries raw bytes (which round-trip
+    verbatim through untyped dict fields) instead of a Python list or the
+    decoder's (dtype, shape, aux_index) tuple.  Rebuild the tensor here so
+    the Talker / code2wav consumers can use it directly.  Legacy lists and
+    decoder tuples are handled too for backward compatibility.
+    """
+    if isinstance(value, dict) and value.get("__t44_tensor__") is not None:
+        shape = [int(d) for d in value.get("shape", [])]
+        data = value.get("data")
+        try:
+            import numpy as np
+            import torch
+
+            np_dtype = np.dtype(value["__t44_tensor__"])
+            if not data:
+                return torch.empty(shape, dtype=getattr(torch, value["__t44_tensor__"]))
+            arr = np.frombuffer(bytes(data), dtype=np.uint8)
+            return torch.from_numpy(arr.view(np_dtype).reshape(shape).copy())
+        except Exception:
+            return value
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 3
+        and isinstance(value[0], str)
+        and isinstance(value[1], (list, tuple))
+        and (isinstance(value[2], (bytes, memoryview, bytearray)) or value[2] is None)
+    ):
+        shape = [int(d) for d in value[1]]
+        data = value[2]
+        try:
+            import numpy as np
+            import torch
+
+            np_dtype = np.dtype(value[0])
+            if data is None or len(data) == 0:
+                return torch.empty(shape, dtype=getattr(torch, value[0]))
+            arr = np.frombuffer(bytes(data), dtype=np.uint8)
+            return torch.from_numpy(arr.view(np_dtype).reshape(shape).copy())
+        except Exception:
+            return value
+    return value
+
+
 def get_stream_request_key(info: dict[str, object]) -> str:
     key = info.get("global_request_id") or info.get("request_id") or info.get("_omni_req_id")
     if isinstance(key, (list, tuple)):

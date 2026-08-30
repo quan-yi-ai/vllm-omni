@@ -68,6 +68,9 @@ class StageEngineCoreProc(EngineCoreProc):
         omni_replica_id: int = 0,
         **kwargs: Any,
     ) -> None:
+        from vllm_omni.utils.cpu_isolation import isolate_host_thread
+        _g = int(omni_stage_id) + 1 if omni_stage_id is not None else 1
+        isolate_host_thread(group=_g)
         """Launch StageEngineCoreProc busy loop in background process.
 
         Omni-specific kwargs:

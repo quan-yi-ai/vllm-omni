@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
-_FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
+_FINAL_OUTPUT_IDLE_SLEEP_S = 0.0001
 
 
 class AsyncEventResolver:

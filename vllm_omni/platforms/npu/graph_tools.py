@@ -47,16 +47,10 @@ class NPUExactGraphRunner:
         max_graphs: int = 32,
         component_name: str = "device graph",
         disable_config_hint: str = "disable graph capture",
-        recoverable: bool = True,
     ) -> None:
         self.max_graphs = max(0, int(max_graphs))
         self.component_name = component_name
         self.disable_config_hint = disable_config_hint
-        # A failed capture used to permanently poison the stage process (the
-        # torch-npu allocator/RNG state may be invalid). Mark-and-skip keeps
-        # the stage serving eagerly: this key falls back permanently, while
-        # other signatures can still capture and replay.
-        self.recoverable = recoverable
         self._enabled = self.max_graphs > 0
         self._graphs: dict[tuple[object, ...], CapturedDeviceGraph] = {}
         self._failed_keys: set[tuple[object, ...]] = set()
@@ -88,13 +82,9 @@ class NPUExactGraphRunner:
             return False
 
     def _eligible(self, inputs: tuple[torch.Tensor, ...]) -> bool:
-        if not self._enabled:
-            return False
-        if self._failed_keys and not self.recoverable:
-            # Hard-fail mode still treats any failure as a poisoned process.
-            return False
         return (
-            bool(inputs)
+            self._enabled
+            and bool(inputs)
             and all(value.device.type == "npu" for value in inputs)
             and self.is_supported()
             and not self._stream_is_capturing()
@@ -137,7 +127,7 @@ class NPUExactGraphRunner:
         constants: tuple[object, ...],
         compute: Callable[..., tuple[torch.Tensor, ...]],
     ) -> tuple[torch.Tensor, ...]:
-        if self._failed_keys and not self.recoverable:
+        if self._failed_keys:
             raise RuntimeError(
                 f"{self.component_name} cannot continue after a failed NPUGraph capture; "
                 f"restart the stage process and {self.disable_config_hint} before retrying."
@@ -150,10 +140,6 @@ class NPUExactGraphRunner:
             constants,
             tuple(_tensor_signature(value) for value in inputs),
         )
-        if key in self._failed_keys:
-            # Recoverable mode: this signature already failed capture once;
-            # serve it eagerly forever instead of poisoning the stage.
-            return compute(*inputs)
         graph = self._graphs.get(key)
         if graph is not None:
             self._hits += 1
@@ -175,18 +161,6 @@ class NPUExactGraphRunner:
             self._graphs[key] = self.capture(inputs, compute)
         except Exception as exc:
             self._failed_keys.add(key)
-            if self.recoverable:
-                # Failed capture invalidates graph-mode assumptions for this
-                # signature only. Already-captured graphs keep replaying (they
-                # captured cleanly), and this signature serves eagerly forever
-                # instead of poisoning the whole stage process.
-                logger.exception(
-                    "%s failed to capture NPUGraph for %s; falling back to "
-                    "eager execution for this tensor signature.",
-                    self.component_name,
-                    operation,
-                )
-                return eager_outputs
             self._enabled = False
             logger.exception(
                 "%s failed to capture NPUGraph for %s; the torch-npu "

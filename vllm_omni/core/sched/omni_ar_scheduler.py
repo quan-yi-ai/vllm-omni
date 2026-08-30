@@ -31,6 +31,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
+import os
 
 logger = init_logger(__name__)
 
@@ -43,6 +44,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # R5 runner-local Talker decode: pre-allocate K-1 lookahead KV slots
+        # so the K-token window never crosses a block boundary. allocate_slots
+        # natively multi-allocates with num_lookahead_tokens; without it the
+        # post-schedule nst bump allocates only 1 slot and the window drifts
+        # across blocks (WER 2.12% -> 1.00% at K=1). Talker stage only.
+        try:
+            _mc = self.vllm_config.model_config
+            _cc = getattr(_mc, 'stage_connector_config', None)
+            if isinstance(_cc, dict):
+                _extra = _cc.get('extra', _cc)
+            else:
+                _extra = getattr(_cc, 'extra', None)
+            _k = 12
+            if isinstance(_extra, dict):
+                _v = _extra.get('talker_local_decode_steps')
+                if _v is not None:
+                    _k = max(1, int(_v))
+            _env_k = os.environ.get('OMNI_TALKER_SCHED_K')
+            if _env_k is not None and _env_k.strip().isdigit():
+                _k = max(1, int(_env_k.strip()))
+            _sid = getattr(_mc, 'stage_id', None)
+            _want = 1
+            if isinstance(_extra, dict):
+                _sv = _extra.get('talker_local_decode_stage_id')
+                if _sv is not None:
+                    _want = int(_sv)
+            if _k > 1 and (str(_sid) == str(_want)):
+                self.num_lookahead_tokens = _k - 1
+        except Exception:
+            pass
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -234,6 +265,60 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting)
+
+        # R5 runner-local Talker decode: engine must schedule exactly K tokens
+        # per step for the talker stage so the runner can decompose them into
+        # K sequential 1-token forwards. Knob from deploy connector extra.
+        sched_k = 12
+        try:
+            _mc = getattr(self.vllm_config, "model_config", None)
+            _cc = getattr(_mc, "stage_connector_config", None)
+            if isinstance(_cc, dict):
+                _extra = _cc.get("extra", _cc)
+            else:
+                _extra = getattr(_cc, "extra", None)
+            if isinstance(_extra, dict):
+                _v = _extra.get("talker_local_decode_steps")
+                if _v is not None:
+                    sched_k = max(1, int(_v))
+        except Exception:
+            sched_k = 0
+        try:
+            _env_k = os.environ.get("OMNI_TALKER_SCHED_K")
+            if _env_k is not None and _env_k.strip().isdigit():
+                sched_k = max(1, int(_env_k.strip()))
+        except Exception:
+            pass
+        if sched_k > 1 and not self.is_encoder_decoder:
+            try:
+                model_cfg = getattr(self.vllm_config, "model_config", None)
+                stage_id = getattr(model_cfg, "stage_id", None)
+                _cc2 = getattr(model_cfg, "stage_connector_config", None)
+                if isinstance(_cc2, dict):
+                    _e2 = _cc2.get("extra", _cc2)
+                else:
+                    _e2 = getattr(_cc2, "extra", None)
+                want_stage = "1"
+                if isinstance(_e2, dict):
+                    _sv = _e2.get("talker_local_decode_stage_id")
+                    if _sv is not None:
+                        want_stage = str(int(_sv))
+                if (want_stage is None or str(stage_id) == want_stage) and scheduler_output.total_num_scheduled_tokens > 0:
+                    nst = scheduler_output.num_scheduled_tokens
+                    if nst and all(v == 1 for v in nst.values()) and len(nst) == 1:
+                        req_id = next(iter(nst))
+                        request = self.requests.get(req_id)
+                        if request is not None and not request.is_prefill_chunk:
+                            nst[req_id] = sched_k
+                            scheduler_output.total_num_scheduled_tokens += sched_k - 1
+                            # _update_after_schedule already advanced the engine
+                            # counter by the ORIGINAL count (1) inside
+                            # super().schedule(). Advance the remainder so the
+                            # next window snapshot starts exactly K positions
+                            # past this window (no overlap / no gap).
+                            request.num_computed_tokens += sched_k - 1
+            except Exception:
+                init_logger(__name__).exception("R5 sched K post-process failed")
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData

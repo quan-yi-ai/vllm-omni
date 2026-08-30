@@ -304,7 +304,7 @@ class OmniStageSchedulerConfig:
     max_num_batched_tokens: int | None = Field(default=None, ge=1)
     max_model_len: int | None = Field(default=None, ge=-1)
     enable_chunked_prefill: bool = False
-    async_scheduling: bool = True
+    async_scheduling: bool = False
 
     def __post_init__(self) -> None:
         if self.max_num_batched_tokens is not None and self.max_num_batched_tokens < self.max_num_seqs:

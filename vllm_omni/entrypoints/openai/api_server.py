@@ -1682,6 +1682,50 @@ async def duplex_websocket(websocket: WebSocket):
 _remove_route_from_router(router, "/health")
 
 
+# W4-I03+I04: one-shot health-triggered full-chain prewarm state.
+_prewarm_health_state = {"done": False}
+
+
+async def _w4_full_chain_prewarm(app_state) -> None:
+    """Run one synthetic TTS request through all stages to absorb the
+    one-time graph captures / kernel compiles. Failure is warning-only."""
+    import base64
+    import io
+    import logging
+    import urllib.request
+
+    logger = logging.getLogger("vllm_omni.w4_prewarm")
+    logger.info("[W4-I03] full-chain prewarm task started")
+
+    try:
+        port = getattr(app_state, "server_port", None)
+        if not port:
+            port = 8094
+        body = {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "messages": [
+                {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
+                {"role": "user", "content": [{"type": "text", "text": "你好"}]},
+            ],
+            "max_tokens": 64,
+            "temperature": 0.0,
+            "extra_body": {
+                "chat_template_kwargs": {"use_tts_template": True},
+                "modalities": ["text", "audio"],
+            },
+        }
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=__import__("json").dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            resp.read()
+        logger.info("[W4-I03] health-triggered full-chain prewarm done")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[W4-I03] full-chain prewarm failed (non-fatal): %s", exc)
+
+
 @router.get("/health")
 async def health(raw_request: Request) -> JSONResponse:
     """Health check endpoint that works for both LLM and diffusion modes.
@@ -1700,6 +1744,16 @@ async def health(raw_request: Request) -> JSONResponse:
 
     try:
         await engine_client.check_health()
+        _w4_env = os.environ.get("W4_PREWARM", "1")
+        print(f"[W4-I03] health handler: env={_w4_env} done={_prewarm_health_state['done']}", flush=True)
+        if _w4_env == "1" and not _prewarm_health_state["done"]:
+            _prewarm_health_state["done"] = True
+            _w4_task = asyncio.create_task(_w4_full_chain_prewarm(raw_request.app.state))
+            _w4_task.add_done_callback(lambda t: print(
+                f"[W4-I03] prewarm task done ok={t.cancelled() or t.exception() is None} exc={t.exception()}",
+                flush=True)
+            )
+
         return JSONResponse(content={"status": "healthy"})
     except EngineDeadError:
         return JSONResponse(

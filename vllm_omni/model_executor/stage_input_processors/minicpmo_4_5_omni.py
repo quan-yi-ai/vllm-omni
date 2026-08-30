@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -106,10 +107,26 @@ def _coerce_token_id_list(value):
 
 
 def _to_transport_list(value):
+    """Stage0->1 handoff transport value (T44).
+
+    Default (fast) path: encode the CPU tensor as a tagged raw-bytes blob
+    (``{"__t44_tensor__": dtype, "shape": [...], "data": bytes}``) so the
+    EngineCoreRequest msgspec transport carries raw bytes instead of nested
+    Python lists (the tolist() + msgpack path cost 25-45ms/request) and the
+    untyped-dict decoder cannot mangle it (it passes bytes through verbatim).
+    Legacy list path is restored with VLLM_OMNI_HANDOFF_LIST_LEGACY=1.
+    """
     if hasattr(value, "detach"):
         value = value.detach().cpu()
     if isinstance(value, torch.Tensor):
-        return value.tolist()
+        if os.environ.get("VLLM_OMNI_HANDOFF_LIST_LEGACY", "0") == "1":
+            return value.tolist()
+        value = value.contiguous() if not value.is_contiguous() else value
+        return {
+            "__t44_tensor__": str(value.dtype).removeprefix("torch."),
+            "shape": list(value.shape),
+            "data": value.numpy().tobytes(),
+        }
     return value
 
 
@@ -125,72 +142,23 @@ def _coerce_int(value):
         return None
 
 
-def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
+    initial_chunk_frames = int(config.get("initial_codec_chunk_frames") or 3)
     left_context_frames = int(config.get("codec_left_context_frames", 3))
-    if chunk_frames <= 0 or left_context_frames < 0:
+    if chunk_frames <= 0 or initial_chunk_frames < 0 or left_context_frames < 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
             f"codec_chunk_frames={chunk_frames}, "
+            f"initial_codec_chunk_frames={initial_chunk_frames}, "
             f"codec_left_context_frames={left_context_frames}"
         )
-    return chunk_frames, left_context_frames
-
-
-def _initial_chunk_frames(transfer_manager: Any, chunk_frames: int, request: Any = None) -> int:
-    """Optional smaller first-chunk threshold for fast first audio.
-
-    Read once from connector extra config ``initial_codec_chunk_frames``
-    (mirrors the qwen3_tts / cosyvoice3 / fish_speech processors). Values
-    <= 0 disable the feature (first chunk uses the steady ``chunk_frames``
-    threshold, i.e. upstream default behaviour). The value is clamped to
-    (0, chunk_frames]: a value >= chunk_frames would only add latency.
-
-    Per-request override: the API layer routes
-    ``initial_codec_chunk_frames`` through tts_params (additional_information)
-    to enable the fast first chunk for streaming requests only and explicitly
-    disable it (0) for non-streaming ones, where an extra small decode only
-    costs throughput without any latency benefit.
-    """
-    if request is not None:
-        request_info = getattr(request, "additional_information", None)
-        entry = None
-        if isinstance(request_info, Mapping):
-            entry = request_info.get("initial_codec_chunk_frames")
-        elif hasattr(request_info, "entries"):
-            entry = request_info.entries.get("initial_codec_chunk_frames")
-        if entry is not None:
-            try:
-                if hasattr(entry, "list_data") and entry.list_data is not None:
-                    value = entry.list_data[0] if len(entry.list_data) else None
-                elif isinstance(entry, (list, tuple)):
-                    value = entry[0] if len(entry) else None
-                else:
-                    value = entry
-                per_request = int(value) if value is not None else -1
-            except (TypeError, ValueError, IndexError):
-                per_request = -1
-            if per_request >= 0:
-                return per_request if 0 < per_request < chunk_frames else 0
-    cached = getattr(transfer_manager, "_minicpmo45_initial_chunk_frames", None)
-    if cached is not None:
-        return cached
-    connector = getattr(transfer_manager, "connector", None)
-    raw_config = getattr(connector, "config", {}) or {}
-    config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
-    config = config if isinstance(config, dict) else {}
-    try:
-        initial = int(config.get("initial_codec_chunk_frames") or 0)
-    except (TypeError, ValueError):
-        initial = 0
-    if initial <= 0 or initial >= chunk_frames:
-        initial = 0
-    transfer_manager._minicpmo45_initial_chunk_frames = initial
-    return initial
+    initial_chunk_frames = min(initial_chunk_frames or chunk_frames, chunk_frames)
+    return chunk_frames, initial_chunk_frames, left_context_frames
 
 
 def _codec_scalars(value: Any) -> list[int]:
@@ -321,6 +289,7 @@ def tts2code2wav_async_chunk(
             "pending": [],
             "pending_text_utf8": [],
             "segment_text_recorded": False,
+            "segment_chunks_emitted": 0,
             "left_context": [],
             "codec_end": 0,
         }
@@ -341,28 +310,17 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
-    chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    chunk_frames, initial_chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    active_chunk_frames = initial_chunk_frames if state["segment_chunks_emitted"] == 0 else chunk_frames
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    # Fast first audio: for the very first chunk of a request, an optional
-    # smaller threshold (initial_codec_chunk_frames) fires the first
-    # stage2 decode earlier, cutting TTFB at the cost of one extra small
-    # chunk. Steady-state chunks keep the full chunk_frames threshold.
-    effective_chunk_frames = chunk_frames
-    if (
-        not flush_pending
-        and int(state["codec_end"]) == 0
-    ):
-        initial_frames = _initial_chunk_frames(transfer_manager, chunk_frames, request)
-        if initial_frames > 0:
-            effective_chunk_frames = initial_frames
-    if not flush_pending and len(pending) < effective_chunk_frames:
+    if not flush_pending and len(pending) < active_chunk_frames:
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else effective_chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else active_chunk_frames)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -383,12 +341,16 @@ def tts2code2wav_async_chunk(
         context = []
         output_codes = []
     state["codec_end"] = codec_end
+    if new_token_count:
+        state["segment_chunks_emitted"] += 1
     code_flat_numel = len(output_codes)
     if native_duplex and code_flat_numel > 0:
         segment_text_utf8 = torch.tensor(pending_text_utf8, dtype=torch.uint8)
         pending_text_utf8.clear()
     if native_duplex and finished:
         state["segment_text_recorded"] = False
+        if not last_chunk:
+            state["segment_chunks_emitted"] = 0
     if flush_pending and not last_chunk and code_flat_numel == 0:
         # Keep the generic generation connector model-agnostic: a real token
         # makes this control-only TTS boundary schedulable, while the explicit
@@ -459,7 +421,7 @@ def tts2code2wav_full_payload(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     codes = _extract_codec_delta(pooling_output, request_id)
-    _, left_context_frames = _codec_config(transfer_manager)
+    _, _, left_context_frames = _codec_config(transfer_manager)
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]
 
@@ -735,31 +697,6 @@ def _build_tts_scheduler_prompt_token_ids(
     raise ValueError("MiniCPM-o TTS stage requires at least one scheduler prompt token")
 
 
-# API-routed TTS overrides that stage 1's output-boundary processor reads.
-# Kept explicit so forwarding stays cheap (scalars only) and new API fields
-# must consciously opt in rather than leaking onto every stage-1 request.
-_STAGE1_TTS_OVERRIDE_KEYS = ("initial_codec_chunk_frames",)
-
-
-def _forward_stage1_tts_overrides(prompt: Any) -> dict[str, Any] | None:
-    """Whitelist-copy per-request TTS overrides from the API prompt dict.
-
-    The API layer (serving_speech) routes streaming-vs-non-streaming
-    ``initial_codec_chunk_frames`` decisions through
-    ``prompt["additional_information"]``. That payload is attached to the
-    stage-0 request only; stage 1 receives whatever this module forwards in
-    the OmniTokensPrompt. Return ``None`` when nothing relevant is present so
-    the orchestrator skips payload serialization entirely.
-    """
-    if not isinstance(prompt, Mapping):
-        return None
-    info = prompt.get("additional_information")
-    if not isinstance(info, Mapping):
-        return None
-    forwarded = {key: info[key] for key in _STAGE1_TTS_OVERRIDE_KEYS if key in info}
-    return forwarded or None
-
-
 def llm2tts(
     source_outputs,
     prompt: OmniTokensPrompt | TextPrompt = None,
@@ -896,6 +833,46 @@ def llm2tts(
                 }
             tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
             tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+            # Multimodal inputs (image/audio/video) expand to more hidden rows
+            # than the collapsed <image>/<audio> tokens in token ids (e.g. 1
+            # image token -> 55 rows). All vision rows sit ahead of the text
+            # rows, so every token index at/after the vision region maps to
+            # hidden index + offset. Text-only requests have offset 0 and
+            # stay bit-identical (zh WER 0.99% unchanged).
+            # Vision features expand to more hidden rows than the collapsed
+            # <image>/<video> tokens in token ids (e.g. 1 image token -> 55
+            # rows). All vision rows sit ahead of the text rows, so every
+            # token index at/after the vision region maps to hidden index +
+            # offset. Text-only requests have offset 0 (hidden_rows ==
+            # token_rows) and stay bit-identical (zh WER 0.99% unchanged).
+            if not is_native_duplex_handoff:
+                # Multimodal gate: image/video/audio placeholders merge to
+                # unk_token_id 128244 (official minicpmo_4_5_omni_llm.py
+                # merge_multimodal_embeddings). Their features expand to more
+                # hidden rows than token ids; text-only has no 128244 and
+                # stays on the official direct slice (bit-identical,
+                # WER 0.99%). The +5 text-only baseline drift (NPU padding/
+                # EOF rows) is NOT a vision offset and must not shift.
+                _has_mm = any(t == 128244 for t in full_token_ids)
+                _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids) if _has_mm else 0
+                __import__("logging").getLogger("vllm_omni.gated").warning(
+                    "[gated-dbg] has_mm=%s off=%d hidden=%d tokens=%d bos=%d",
+                    _has_mm, _hidden_offset, thinker_hidden_states.shape[0],
+                    len(full_token_ids), tts_bos_idx,
+                )
+                if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
+                    _token_end = end_idx if tts_eos_idx is not None else len(full_token_ids)
+                    _h_start = tts_bos_idx + _hidden_offset
+                    _h_end = _token_end + _hidden_offset
+                    if _h_start < _h_end and _h_end <= thinker_hidden_states.shape[0]:
+                        tts_hidden_slice = thinker_hidden_states[_h_start:_h_end].to(torch.float32).contiguous()
+                    else:
+                        tts_hidden_slice = thinker_hidden_states[tts_bos_idx:_token_end].to(torch.float32).contiguous()
+                else:
+                    _token_end2 = end_idx if tts_eos_idx is not None else len(full_token_ids)
+                    tts_hidden_slice = thinker_hidden_states[tts_bos_idx:_token_end2].to(torch.float32).contiguous()
+            else:
+                tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
             # <|tts_bos|> boundary before generation. A segment delta can
@@ -1020,6 +997,18 @@ def llm2tts(
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
+        if (
+            tts_token_ids_slice is not None
+            and tts_hidden_slice is not None
+            and tts_token_ids_slice.numel() != tts_hidden_slice.shape[0]
+        ):
+            __import__("logging").getLogger("vllm_omni.tts_handoff").error(
+                "TTS handoff length mismatch: token_ids=%d hidden=%d mm=%s off=%d bos=%d",
+                tts_token_ids_slice.numel(), tts_hidden_slice.shape[0],
+                _has_mm if "_has_mm" in dir() else "?",
+                _hidden_offset if "_hidden_offset" in dir() else -1,
+                tts_bos_idx,
+            )
         handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
@@ -1051,18 +1040,6 @@ def llm2tts(
             OmniTokensPrompt(
                 prompt_token_ids=scheduler_prompt_token_ids,
                 model_intermediate_buffer=model_intermediate_buffer,
-                # Forward API-routed per-request TTS overrides to stage 1 so
-                # the talker's output-boundary processor
-                # (tts2code2wav_async_chunk) can read them off its own
-                # Request. The orchestrator serializes this dict into the
-                # stage-1 EngineCoreRequest (``_upgrade_processed_stage_request``)
-                # and the scheduler restores it onto the live Request, where
-                # ``_initial_chunk_frames`` looks it up. Whitelist keys rather
-                # than forwarding everything: the API payload can carry heavy
-                # tensors (ref_audio waveforms) that stage 0 needs but the
-                # talker never reads, and duplicating them per chunk costs
-                # shared-memory bandwidth.
-                additional_information=_forward_stage1_tts_overrides(p),
                 multi_modal_data=(
                     multi_modal_data[llm_output.request_id]
                     if requires_multimodal_data and multi_modal_data.get(llm_output.request_id) is not None

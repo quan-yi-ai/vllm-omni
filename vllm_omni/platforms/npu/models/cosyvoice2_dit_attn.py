@@ -52,6 +52,13 @@ def _expand_attn_mask_for_npu(
 
 
 def _patched_attention_forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    # NPU FP16: cast input to weight dtype so that all Linear/Norm/SDPA
+    # operations use consistent types.  Without this, fp32 inputs entering
+    # fp16-weight Attention layers produce mixed-dtype SDPA errors.
+    target_dtype = self.to_q.weight.dtype
+    if x.dtype != target_dtype:
+        x = x.to(target_dtype)
+
     b, t, c = x.shape
 
     q = self.to_heads(self.to_q(x))
@@ -81,6 +88,13 @@ def _patched_attention_forward_chunk(
     att_cache: torch.Tensor | None = None,
     attn_mask: torch.Tensor | None = None,
 ):
+    # NPU FP16: cast input & cache to weight dtype for consistent SDPA.
+    target_dtype = self.to_q.weight.dtype
+    if x.dtype != target_dtype:
+        x = x.to(target_dtype)
+    if att_cache is not None and att_cache.dtype != target_dtype:
+        att_cache = att_cache.to(target_dtype)
+
     b, t, c = x.shape
 
     q = self.to_heads(self.to_q(x))

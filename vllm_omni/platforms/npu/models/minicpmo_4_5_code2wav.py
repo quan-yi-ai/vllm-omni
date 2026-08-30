@@ -24,6 +24,10 @@ _original_decode_batch = None
 _backend_graph_runners: WeakKeyDictionary[object, NPUExactGraphRunner] = WeakKeyDictionary()
 _ENABLE_KEY = "code2wav_enable_npu_graph"
 _MAX_GRAPHS_KEY = "code2wav_max_npu_graphs"
+# Escape hatch for operators: VLLM_OMNI_CODE2WAV_NPU_GRAPH=0 forces eager
+# even when no deploy-yaml additional_config is present (e.g. serving the
+# official stock minicpmo_4_5.yaml, which never sets these keys).
+_ENV_DISABLE_KEY = "VLLM_OMNI_CODE2WAV_NPU_GRAPH"
 
 
 def _config_bool(value: object, default: bool) -> bool:
@@ -32,6 +36,10 @@ def _config_bool(value: object, default: bool) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _env_disabled() -> bool:
+    return _config_bool(os.environ.get(_ENV_DISABLE_KEY), True) is False
 
 
 def _graph_config(model: object) -> dict[str, object]:
@@ -207,7 +215,11 @@ def _patched_build_backend(self) -> None:
 
     config = _graph_config(self)
     max_graphs = max(0, int(config.get(_MAX_GRAPHS_KEY, 32)))
-    graph_enabled = max_graphs > 0 and _config_bool(config.get(_ENABLE_KEY), False)
+    # Default ON for NPU: the official benchmark harness serves the stock
+    # deploy yaml (no additional_config keys), which used to silently disable
+    # the -2.4% RTF NPUGraph win. An explicit yaml value or env var wins.
+    default_enabled = not _env_disabled()
+    graph_enabled = max_graphs > 0 and _config_bool(config.get(_ENABLE_KEY), default_enabled)
     if graph_enabled:
         # NPUOmniPlatform enables internal format for quantized LLM kernels.
         # Code2Wav uses regular convolution kernels that must remain in the
@@ -222,8 +234,10 @@ def _patched_build_backend(self) -> None:
         graph_runner = NPUExactGraphRunner(
             max_graphs=max_graphs,
             component_name="MiniCPM-o Code2Wav",
+            recoverable=True,
             disable_config_hint=(
-                "set platforms.npu.stages[stage_id=2].additional_config.code2wav_enable_npu_graph=false"
+                "set platforms.npu.stages[stage_id=2].additional_config.code2wav_enable_npu_graph=false "
+                f"or {_ENV_DISABLE_KEY}=0"
             ),
         )
         if self.backend.speech_window.device.type == "npu" and not graph_runner.is_supported():

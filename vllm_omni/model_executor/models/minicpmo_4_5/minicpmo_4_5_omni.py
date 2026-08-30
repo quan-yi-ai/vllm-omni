@@ -133,6 +133,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         self._language_model_names = ["model"]
         self.prefer_model_sampler = self.model_stage in {"llm", "tts"}
+        # The Talker samples over 2-wide stop logits and keeps its own codec
+        # history; the duplex LLM sampler is the only stage reading vLLM's
+        # decoded-token history.
+        self.model_sampler_needs_output_token_ids = self.model_stage != "tts"
         # Both AR stages require model-specific embeddings.  The Thinker uses
         # preprocess for duplex audio, while the Talker converts the
         # tts_token_ids/tts_hidden_states handoff into its conditioning
@@ -381,8 +385,15 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
-            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-            return input_ids, embeds, {"duplex": update_result}
+            # A failed append must not feed the scheduler's placeholder
+            # <unit>/</unit> embeddings into the KV. Returning the span as-is
+            # lets the reserved placeholder slots embed through the runner and
+            # land in the KV, measurably corrupting the model's listen/speak
+            # decision (see MiniCPMO45DuplexPolicy framing note). Return an
+            # empty span so the runner's overlay copies nothing and the
+            # request simply does not advance this step.
+            empty = input_ids.new_empty(0)
+            return empty, empty, {"duplex": update_result}
 
         target_dtype = (
             input_embeds.dtype if input_embeds is not None else self.get_input_embeddings(input_ids[:1]).dtype

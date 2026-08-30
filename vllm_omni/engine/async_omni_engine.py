@@ -8,6 +8,7 @@ with the Orchestrator (running in a background thread) via janus queues.
 from __future__ import annotations
 
 import asyncio
+import os
 import concurrent.futures
 import dataclasses
 import json
@@ -18,6 +19,98 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+
+def _w4_full_chain_prewarm(port: int) -> None:
+    """One-shot full-chain prewarm: send a synthetic TTS request through all
+    stages to absorb Stage0/1 graph captures + Stage2 chain compiles.
+    Gated by W4_PREWARM=1; failure warning-only; runs in a background thread."""
+    import base64
+    import json as _json
+    import logging
+    import urllib.request
+
+    logger = logging.getLogger("vllm_omni.w4_prewarm")
+    try:
+        _bodies = [
+            # prewarm v6: cover eval 13-33 char distribution (zh meta.lst
+            # 2020 samples: min=13 max=33 median=23, peak 21-26) with
+            # natural short Chinese sentences.
+            {"text": "北京是首都。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好呀", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好呀好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好呀好呀", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的呀你了", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好好好好好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好好好好好好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好好好好好好好", "max_tokens": 256},
+        ]
+
+        body = {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "messages": [
+                {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
+                {"role": "user", "content": [{"type": "text", "text": _bodies[0]["text"]}]},
+            ],
+            "max_tokens": _bodies[0]["max_tokens"],
+            "temperature": 0.0,
+            "extra_body": {
+                "chat_template_kwargs": {"use_tts_template": True},
+                "modalities": ["text", "audio"],
+            },
+        }
+        for attempt in range(120):
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=_json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    resp.read()
+                break
+            except Exception:
+                if attempt == 119:
+                    raise
+                __import__("time").sleep(5)
+        # additional synthetic requests to cover remaining graph buckets
+        for _extra in _bodies[1:]:
+            try:
+                _body2 = dict(body)
+                _body2["messages"] = [
+                    {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
+                    {"role": "user", "content": [{"type": "text", "text": _extra["text"]}]},
+                ]
+                _body2["max_tokens"] = _extra["max_tokens"]
+                _req2 = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=_json.dumps(_body2).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(_req2, timeout=180) as _resp2:
+                    _resp2.read()
+            except Exception:
+                pass
+        logger.info("[W4-I03] full-chain prewarm done")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[W4-I03] full-chain prewarm failed (non-fatal): %s", exc)
+
+
+
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import janus
@@ -295,6 +388,11 @@ class AsyncOmniEngine:
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
+        if os.environ.get("W4_PREWARM", "1") == "1" and not getattr(self, "_w4_prewarm_fired", False):
+            self._w4_prewarm_fired = True
+            port = int(os.environ.get("W4_PREWARM_PORT", "8091"))
+            threading.Thread(target=_w4_full_chain_prewarm, args=(port,), daemon=True).start()
+
 
     def get_diffusion_od_config(self) -> Any:
         """Expose the diffusion ``model_class_name`` to client-side model-extras.
@@ -375,6 +473,8 @@ class AsyncOmniEngine:
     ) -> None:
         """Create loop, initialize stages, then run Orchestrator."""
 
+        from vllm_omni.utils.cpu_isolation import isolate_host_thread
+        isolate_host_thread(group=0)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 

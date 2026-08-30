@@ -30,6 +30,23 @@ from .batched_token2wav import (
 logger = init_logger(__name__)
 
 
+def _get_token2wav_class() -> type[Any]:
+    """Resolve the Token2wav class, preferring the in-tree NPU adapter."""
+    from vllm_omni.platforms import current_omni_platform
+
+    if current_omni_platform.is_npu():
+        # NPU/Ascend: keep the in-tree NPU-aware adapter (HiFT linear downsample,
+        # DiT mask expand, MATH SDPA + FFT STFT fixes) at its original path.
+        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+            MiniCPMO45Token2wav,
+        )
+
+        return MiniCPMO45Token2wav
+    from stepaudio2.token2wav import Token2wav
+
+    return Token2wav
+
+
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
     return RuntimeError(f"MiniCPMO45Code2WavBatchError {json.dumps(payload, sort_keys=True)}")
@@ -196,6 +213,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         sample_rate: Any,
     ) -> tuple[str, _RuntimePrompt]:
         sample_rate_hz = int(_scalar(sample_rate, 0))
+        from vllm_omni.experimental.fullduplex.engine.intermediate import normalize_handoff_tensor
+
+        ref_audio = normalize_handoff_tensor(ref_audio)
         waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu().contiguous()
         if sample_rate_hz <= 0:
             raise _batch_error("invalid_ref_audio_sample_rate", sample_rate=sample_rate_hz)
@@ -310,11 +330,17 @@ class MiniCPMO45Code2Wav(nn.Module):
         normalized = [int(value) for value in counts]
         if any(value < 0 for value in normalized):
             raise _batch_error("negative_seq_token_count", counts=normalized)
-        if sum(normalized) != int(flat.numel()):
+        total = int(flat.numel())
+        expected = sum(normalized)
+        if expected < total:
+            # cudagraph/aclgraph decode pads the batch with trailing dummy tokens
+            # that are not codec data; trim them before segmenting.
+            flat = flat[:expected]
+        elif expected > total:
             raise _batch_error(
                 "seq_token_count_mismatch",
                 counts=normalized,
-                total=int(flat.numel()),
+                total=total,
             )
         return list(torch.split(flat, normalized))
 
@@ -612,7 +638,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
                 )
-                states = self.backend.setup_batch(features, len(bucket))
+                states = self.backend.setup_batch(
+                    features,
+                    len(bucket),
+                    prompt_cache_id=bucket[0].prompt_cache_id,
+                    prompt_wav=bucket[0].prompt_wav,
+                )
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -646,7 +677,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_wav,
                 )
                 if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
+                    states = self.backend.setup_batch(
+                        features,
+                        batch_size,
+                        prompt_cache_id=bucket[0].prompt_cache_id,
+                        prompt_wav=bucket[0].prompt_wav,
+                    )
                 else:
                     states = [item.previous.token2wav for item in bucket if item.previous is not None]
                 tokens = torch.stack([item.tokens for item in bucket], dim=0)
@@ -740,18 +776,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self.backend is not None:
             return
 
-        from vllm_omni.platforms import current_omni_platform
-
-        if current_omni_platform.is_npu():
-            # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
-            # so use the in-tree NPU-aware adapter instead. It delegates to
-            # StepAudio2Token2WavCore, which auto-applies the Ascend fixes
-            # (HiFT linear downsample, DiT mask expand, MATH SDPA) on NPU.
-            from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
-                MiniCPMO45Token2wav as Token2wav,
-            )
-        else:
-            from stepaudio2.token2wav import Token2wav
+        Token2wav = _get_token2wav_class()
 
         extra = self._extra_config()
         model_root = self._resolve_model_root()
@@ -761,22 +786,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         token2wav_path = model_root / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
-        use_float16 = bool(extra.get("token2wav_float16", False))
-        # CFM Euler steps. Upstream default is 10; 3 keeps zh WER at 1.46%
-        # vs the 1.56% gate (public 910C measurement) with ~3x fewer estimator
-        # forwards per mel chunk. 2 breaks engine init — 3 is the floor for
-        # the pure step-count reduction; go below it with jump_steps below.
-        n_timesteps = int(extra.get("token2wav_n_timesteps", 3))
-        # Trajectory jump: stop the CFM loop after this many estimator
-        # forwards and extrapolate to t=1 (see BatchedToken2Wav._decode_cfm).
-        # 0 disables (full n_timesteps loop). With n_timesteps=3, 2 equals
-        # two estimator forwards per chunk; 910C-measured RTF 0.3943 -> 0.37.
-        jump_steps = int(extra.get("token2wav_jump_steps", 0))
-        if jump_steps and jump_steps >= n_timesteps:
-            raise ValueError(
-                "MiniCPM-o Code2Wav token2wav_jump_steps must be < "
-                f"token2wav_n_timesteps ({n_timesteps}), got {jump_steps}"
-            )
+        use_float16 = bool(extra.get("token2wav_float16", True))
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -786,8 +796,166 @@ class MiniCPMO45Code2Wav(nn.Module):
             token2wav = Token2wav(
                 str(token2wav_path),
                 float16=use_float16,
-                n_timesteps=n_timesteps,
+                n_timesteps=int(extra.get("token2wav_n_timesteps", 3)),
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav, jump_steps=jump_steps)
+        self.backend = BatchedToken2Wav(token2wav)
+        self._maybe_warmup_hift()
+        self._maybe_preseed_setup_batch()
+        self._maybe_preseed_all_refs()
+        self._maybe_prewarm_chain()
+
+    def _maybe_warmup_hift(self) -> None:
+        """Run one representative HiFT inference before serving requests.
+
+        Gated by ``enable_hift_warmup`` in the stage extra config. The first
+        HiFT forward after loading pays a one-time kernel-compile /
+        weight-load cost (observed ~5.6s on Ascend 910C). Executing it here,
+        during model load and before the API is ready, moves that one-time
+        cost out of the first user request. Uses an independent cache source
+        so no real request state is touched.
+        """
+        extra = self._extra_config()
+        if not extra.get("enable_hift_warmup", True):
+            return
+        backend = getattr(self, "backend", None)
+        if backend is None:
+            return
+        hift = getattr(backend, "hift", None)
+        if hift is None:
+            return
+        device = next(hift.parameters()).device
+        dtype = next(hift.parameters()).dtype
+        # Representative first-chunk mel: [B=1, mel_bins=80, frames].
+        mel = torch.randn(1, 80, 86, device=device, dtype=dtype)
+        cache_source = torch.zeros(1, 1, 0, device=device, dtype=dtype)
+        try:
+            with torch.inference_mode():
+                hift(mel, cache_source)
+            torch.accelerator.synchronize(device)
+            logger.info("HiFT startup warmup done")
+        except Exception:
+            # Warmup is a performance optimization, not a correctness
+            # requirement; never block serving on it.
+            logger.warning(
+                "HiFT startup warmup failed; continuing with cold execution",
+                exc_info=True,
+            )
+        del mel, cache_source
+
+
+    def _maybe_preseed_all_refs(self) -> None:
+        """Startup preseed of all unique seed-tts refs into the N1 prompt cache.
+
+        Lazy prepare_prompt warms only refs seen by warmup requests; a
+        32-prompt bench with ~21 unique refs leaves ~19 first requests cold
+        (~40-90ms S3Tokenizer each). Scan the seed-tts manifest and warm every
+        unique ref through the exact runtime path so cache keys match.
+        Gated by VLLM_OMNI_PRESEED_ALL_REFS=1; failures warn only.
+        """
+        import os
+
+        if os.environ.get("VLLM_OMNI_PRESEED_ALL_REFS", "0") != "1":
+            return
+        root = os.environ.get("SEED_TTS_ROOT", "/root/seed-tts-eval/seedtts_testset").strip()
+        if not root or not os.path.isdir(root):
+            logger.warning("[preseed] SEED_TTS_ROOT=%r not a directory; skipping", root)
+            return
+        backend = getattr(self, "backend", None)
+        if backend is None or not hasattr(backend, "prepare_prompt"):
+            logger.warning("[preseed] backend without prepare_prompt; skipping")
+            return
+        import soundfile as _sf
+
+        refs: set[tuple[str, str]] = set()
+        for locale in ("en", "zh"):
+            meta = os.path.join(root, locale, "meta.lst")
+            if not os.path.isfile(meta):
+                continue
+            try:
+                with open(meta, encoding="utf-8") as fh:
+                    for line in fh:
+                        parts = line.rstrip("\n").split("|")
+                        if len(parts) >= 3:
+                            refs.add((locale, parts[2].strip()))
+            except Exception as exc:
+                logger.warning("[preseed] manifest read failed %s: %s", meta, exc)
+        if not refs:
+            logger.warning("[preseed] no refs found under %r", root)
+            return
+
+        ok = 0
+        for locale, ref in sorted(refs):
+            if not ref:
+                continue
+            wav_path = ref if os.path.isabs(ref) else os.path.join(root, locale, ref)
+            if not os.path.isfile(wav_path):
+                logger.warning("[preseed] ref wav missing: %s/%s", locale, ref)
+                continue
+            try:
+                data, sr = _sf.read(wav_path, dtype="float32")
+                waveform = torch.as_tensor(data, dtype=torch.float32).reshape(-1)
+                cache_key, entry = self._materialize_runtime_prompt(waveform, sr)
+                backend.prepare_prompt(entry.cache_id, entry.path)
+                ok += 1
+            except Exception as exc:
+                logger.warning("[preseed] ref failed %s/%s: %s", locale, ref, exc)
+        logger.info(
+            "[preseed] preseeded %d/%d unique refs (root=%s)", ok, len(refs), root
+        )
+
+    def _maybe_preseed_setup_batch(self) -> None:
+        """Pre-warm the setup_batch (Conformer+CFM prompt decode) cache for the
+        default ref audio at startup, so first-user-request TTFP is not hit by
+        the one-time 30-70ms prompt conditioning. Gated by the same
+        ``enable_hift_warmup`` flag; failure is non-fatal."""
+        extra = self._extra_config()
+        if not extra.get("enable_hift_warmup", True):
+            return
+        backend = getattr(self, "backend", None)
+        if backend is None:
+            return
+        try:
+            features = backend.prepare_prompt(self._default_prompt_id, self._default_prompt_wav)
+            backend.setup_batch(
+                features,
+                1,
+                prompt_cache_id=self._default_prompt_id,
+                prompt_wav=self._default_prompt_wav,
+            )
+            torch.accelerator.synchronize()
+            logger.info(
+                "[T23-N1P] preseeded setup_batch cache for %s (HT_ref_audio)",
+                self._default_prompt_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[T23-N1P] preseed failed (non-fatal): %s", exc)
+
+    def _maybe_prewarm_chain(self) -> None:
+        """Absorb the one-time S3/Conformer/CFM kernel compiles at startup.
+        Runs a representative codec chunk through the Stage2 chain
+        (prepare_prompt + setup_batch + one decode_batch step) so the first
+        real request does not pay compile latency in its mean. Gated by the
+        same ``enable_hift_warmup`` flag; failure is non-fatal."""
+        extra = self._extra_config()
+        if not extra.get("enable_hift_warmup", True):
+            return
+        backend = getattr(self, "backend", None)
+        if backend is None:
+            return
+        try:
+            features = backend.prepare_prompt(self._default_prompt_id, self._default_prompt_wav)
+            states = backend.setup_batch(
+                features,
+                1,
+                prompt_cache_id=self._default_prompt_id,
+                prompt_wav=self._default_prompt_wav,
+            )
+            # one decode step with a representative short token run
+            tokens = torch.tensor([[1, 2, 3, 4]], device=features.speech_tokens.device, dtype=torch.long)
+            backend.decode_batch(tokens, features, states, last_chunk=False)
+            torch.accelerator.synchronize()
+            logger.info("[T23-N3] Stage2 chain prewarm done")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[T23-N3] chain prewarm failed (non-fatal): %s", exc)

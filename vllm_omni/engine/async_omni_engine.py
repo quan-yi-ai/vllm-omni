@@ -48,6 +48,7 @@ def _w4_full_chain_prewarm(port: int) -> None:
         except Exception:
             pass
         return None
+
     try:
         _bodies = [
             # prewarm v6: cover eval 13-33 char distribution (zh meta.lst
@@ -78,13 +79,7 @@ def _w4_full_chain_prewarm(port: int) -> None:
             {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好好好好好好好", "max_tokens": 256},
         ]
 
-        _served = _resolve_served_model()
-        if _served is None:
-            raise RuntimeError(
-                "W4 prewarm could not resolve served model from /v1/models"
-            )
-        body = {
-            "model": _served,
+        body: dict = {
             "messages": [
                 {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
                 {"role": "user", "content": [{"type": "text", "text": _bodies[0]["text"]}]},
@@ -96,20 +91,30 @@ def _w4_full_chain_prewarm(port: int) -> None:
                 "modalities": ["text", "audio"],
             },
         }
+
+        _served: str | None = None
         for attempt in range(120):
-            try:
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/v1/chat/completions",
-                    data=_json.dumps(body).encode(),
-                    headers={"Content-Type": "application/json"},
-                )
-                with urllib.request.urlopen(req, timeout=180) as resp:
-                    resp.read()
-                break
-            except Exception:
-                if attempt == 119:
-                    raise
-                __import__("time").sleep(5)
+            # Lazily resolve the served model inside the retry loop: this
+            # prewarm thread is spawned during engine init, i.e. BEFORE
+            # Uvicorn starts listening, so the first resolution attempts
+            # are expected to fail until startup completes (~1-2 min).
+            if _served is None:
+                _served = _resolve_served_model()
+            if _served is not None:
+                body["model"] = _served
+                try:
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/v1/chat/completions",
+                        data=_json.dumps(body).encode(),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        resp.read()
+                    break
+                except Exception:
+                    if attempt == 119:
+                        raise
+            __import__("time").sleep(5)
         # additional synthetic requests to cover remaining graph buckets
         for _extra in _bodies[1:]:
             try:

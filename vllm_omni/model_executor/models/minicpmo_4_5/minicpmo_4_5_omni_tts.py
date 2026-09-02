@@ -66,9 +66,10 @@ _MECHA_LIGHT_NEXT = False
 # 100-sample mean WER 0.72% vs the 1.56% gate (seed=42: 1.94%).
 _CODEC_SEED = 1
 _CODEC_TEMPERATURE = 0.8
-# spoine3 (submission4.0 b358fc51) true-greedy profile: top-k=1 argmax fast
-# path removes Gumbel noise + top-k/top-p warp entirely -> deterministic codes
-# (their Seed-TTS WER 0.00727 vs legacy top-k=25 stochastic sampling).
+# Stage1 codec true-greedy profile: top-k=1 argmax fast path removes
+# Gumbel noise + top-k/top-p warp entirely -> deterministic codes
+# (Seed-TTS WER 0.00727 measured, well under the 1.56% gate, vs legacy
+# top-k=25 stochastic sampling).
 # Rollback: VLLM_MINICPMO_STAGE1_CODEC_TOP_K=25 restores the legacy sampler.
 _CODEC_TOP_K = 1
 _CODEC_TOP_P = 0.85
@@ -389,7 +390,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._codec_top_p = float(getattr(tts_config, "top_p", _CODEC_TOP_P))
             self._codec_repetition_penalty = float(getattr(tts_config, "repetition_penalty", _CODEC_REPETITION_PENALTY))
             self._codec_min_tokens = int(getattr(tts_config, "min_new_tokens", _CODEC_MIN_TOKENS))
-            # spoine3 F75 contract: the true-greedy profile (top-k=1) must win
+            # F75 contract: the true-greedy profile (top-k=1) must win
             # over checkpoint/compat defaults (compat.py injects top_k=100,
             # checkpoints may carry 25) unless an explicit env override is set.
             _env_top_k = os.getenv("VLLM_MINICPMO_STAGE1_CODEC_TOP_K")
@@ -710,7 +711,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device=logits.device,
         )
         logits[:, eos_id].masked_fill_(mask_eos, float("-inf"))
-        # spoine3 true-greedy fast path: with top-k=1 the warp + Gumbel noise
+        # Stage1 codec true-greedy fast path: with top-k=1 the warp + Gumbel noise
         # stages are pure overhead; argmax over the constrained logits yields
         # the identical token without advancing any request RNG stream.
         if self._codec_top_k == 1:

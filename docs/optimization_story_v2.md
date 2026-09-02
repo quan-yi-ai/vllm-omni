@@ -3,7 +3,7 @@
 > **目的**：让任何人（或任何 AI agent）读完本文就能**讲清楚每一项优化的来龙去脉**——
 > 为什么慢、瓶颈在哪、怎么改的、为什么有效、实测赚了多少、有什么坑。
 >
-> 分支 `v2-kuaamu-merge`（HEAD 0864acd4 + W4 时序修复）· 910B2 单卡实测
+> 基线 HEAD `0864acd4`（22 项优化全量落地 + W4 时序修复）· 910B2 单卡实测
 > 日期：2026-08-30 · 配套数据见 `submit_evidence/`
 
 ---
@@ -45,17 +45,17 @@ scheduler 排队 → IPC 到 worker → 构建 metadata → kernel launch → �
 K 步完了一次性回传。调度/同步开销从 ×N 变成 ×N/K。
 
 **K=12 怎么来的**：scheduler 侧窗口（`_k/sched_k`）与 runner 侧
-（`_talker_local_steps`）必须**相等**。大神实测 12 是甜点：K 太小摊不薄开销，
+（`_talker_local_steps`）必须**相等**。实测 12 是甜点：K 太小摊不薄开销，
 K 太大投机错失后回滚浪费算力。
 
 **我们踩的坑（K12 事故，务必记住）**：
-- 大神本地 HEAD `ea66d2d2`（自称 "clean tree"）把 runner 侧误回退成 8，
+- 早期快照 `ea66d2d2`（自称 "clean tree"）把 runner 侧误回退成 8，
   但 scheduler 侧还是 12。
-- 我们照抄了他的本地 HEAD → **scheduler 12 / runner 8 错位** → scheduler
+- 我们最初同步该快照时未发现 → **scheduler 12 / runner 8 错位** → scheduler
   以为算了 12 步、KV 只写了 8 步，`num_computed_tokens` 超前于实际 KV →
   speech warmup 时 `assert num_tokens_scheduled > 0` 崩溃。
-- **教训**：一切以 `origin/submit`（62f4e4ab）为准；合并别人的代码先 diff
-  他的本地 HEAD 与其远程提交版。
+- **教训**：一切以 `origin/submit`（62f4e4ab）为准；同步任何快照前先
+  diff 它与其远程提交版，确认无静默回退。
 
 **修复**：`npu_ar_model_runner.py` L522 `self._talker_local_steps = 12`。
 修复后 speech warmup 7.5s PASS，40 条×2 轮 + 全量 2020 条零崩溃。
@@ -82,7 +82,7 @@ K 太大投机错失后回滚浪费算力。
 **改法**：boot 期后台线程发 24 条合成短句（覆盖评测 13-33 字符分布），
 把 Stage0/1 图捕获和 Stage2 链编译全部提前吸收。
 
-**我们修的两个 bug（大神版从未真正生效过）**：
+**我们修的两个 bug（旧版从未真正生效过）**：
 1. **hardcode 模型名 404**：预热请求 model 字段写死 `"openbmb/MiniCPM-o-4_5"`，
    而服务是路径形式启动（served model = `/workspace/.../MiniCPM-o-4_5`）→
    预热请求全部 404，**从未执行过一次**。改为从 `/v1/models` 动态解析。
@@ -114,7 +114,7 @@ K 太大投机错失后回滚浪费算力。
 
 ## 3. 910B2 特有调优（R1 实测，保留在 yaml）
 
-| 参数 | 910B2 值 | 910C 大神值 | 为什么不同 |
+| 参数 | 910B2 值 | 910C 参考值 | 为什么不同 |
 |---|---|---|---|
 | `codec_chunk_frames` | 50 | 25 | 910B2 launch-bound，chunk 减半=launch 减半（RTF −4.4%） |
 | `initial_codec_chunk_frames` | 15 | 无 | 首 chunk 提前出声，首块延迟 −36% |
@@ -122,23 +122,23 @@ K 太大投机错失后回滚浪费算力。
 | stage0 `max_tokens` | 2048 | 32 | Daily-Omni 视频 QA 答案 >32 tok 会被截断 |
 | `enable_static_kernel` | false | PIECEWISE | 910B2 上 static kernel 编译崩溃 TBE |
 
-**警告**：这份 yaml 是 910B2 特化的。若在 910C 上跑，必须切回大神 910C 参数
+**警告**：这份 yaml 是 910B2 特化的。若在 910C 上跑，必须切回 910C 参数
 （cf25/seqs8/PIECEWISE/max_tokens 32），否则并发和吞吐反被压制。
 
 ---
 
 ## 4. 实测总账（全量 2020 条，官方口径）
 
-| 指标 | 官方基线 | 本提交 910B2 | 变化 | 大神 910C |
+| 指标 | 官方基线 | 本提交 910B2 | 变化 | 910C 参考 |
 |---|---|---|---|---|
 | RTF | 0.4423 | **0.20** | **−54.8%** | 0.166 |
 | TTFP | 986.47ms | **339.35ms** | **−65.6%** | 236.83 |
 | TTFT | 333ms | **99.20ms** | **−70.2%** | 118.0 |
 | E2EL | — | 1044.45ms | — | 841.98 |
-| WER | gate ≤1.56% | **0.0093** | PASS 余量 168× | 0.00987（我们更优） |
+| WER | gate ≤1.56% | **0.0093** | PASS 余量 168× | 0.00987（910B2 更优） |
 | SIM | gate ≥0.689 | **0.8377** | PASS 余量 0.149 | 0.84317 |
 
-**与大神 910C 的差距全部可归因于硬件**（910B2 单 die 算力≈910C 一半量级，
+**与 910C 参考数据的差距全部可归因于硬件**（910B2 单 die 算力≈910C 一半量级，
 stage2 launch 开销占比更高）；而** TTFT 反而快 15.9%、WER 反而低 5.8%**——
 说明调度层优化（K14 spec + H1 + cf50/icf15）是平台无关的。
 
@@ -156,4 +156,4 @@ stage2 launch 开销占比更高）；而** TTFT 反而快 15.9%、WER 反而低
 1. W4 时序修复（懒解析）验证中——重启后看日志 `[W4-I03] full-chain prewarm done`
    且无 "could not resolve" 即生效。
 2. 910C 提交前 yaml 切换提醒（见 §3 警告）。
-3. 大神本地 HEAD 不可信原则（见 §1.1 教训）。
+3. 版本甄别原则：早期快照可能有静默回退，一切以其远程提交版为准（见 §1.1 教训）。

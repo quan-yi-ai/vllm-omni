@@ -81,7 +81,7 @@ A/B 实测（40 条官方口径、热轮、同固定样本）：
 | SIM | 0.8409 | 0.8404 | 噪声级 |
 
 结论：速度无损有增益、质量在噪声内、确定性可复现 → **保留为默认**。
-日志：`/tmp/bench_greedy/bench40_greedy.log`（服务日志 `/tmp/v3e_server_greedy.log`，
+归档日志：`docs/v21_greedy_bench40.log`（服务日志 `/tmp/v3e_server_greedy.log`，
 生效标记 `true-greedy fast path enabled` + `top-k configured=100 overridden to 1`）。
 
 ### 1.4 本轮修复（commit 0864acd4）
@@ -125,7 +125,7 @@ HTTP 200 / 8.46s；choices[0]=文本 + choices[1]=audio
 | r1（冷） | 994.96 | 333.21 | 0.21 | 92.40 | 0.0062 | 0.8408 |
 | r2（热） | **910.91** | **330.58** | **0.20** | **90.22** | 0.0062 | **0.8409** |
 
-日志：`/tmp/bench_v2/bench40.log`、`bench40_r2.log`
+日志：`docs/v2_bench40.log`（若归档）或 `/tmp/bench_v2/bench40*.log`
 
 ### 2.4 全量 2020 条（官方提交口径，2026-08-30 18:10–18:59 UTC）
 
@@ -140,7 +140,7 @@ HTTP 200 / 8.46s；choices[0]=文本 + choices[1]=audio
 | **WER** | **0.0093** | — | — | ≤1.56% | **PASS**（0 条失败） |
 | **SIM** | **0.8377** | — | — | ≥0.689 | **PASS**（2020/2020） |
 
-日志：`/tmp/bench_v2/bench2020.log` · 原始 JSON：`v2_zh2020_full.json`（844KB，已归档本目录）
+日志：`docs/v2_bench2020_full.log` · 原始 JSON：`docs/v2_zh2020_full.json`（844KB，已归档本目录）
 
 > 注：全量 E2EL（1044）略高于 40 条热轮（911），因 2020 条含更长文本分布（40 条
 > disable-shuffle 取的是头部偏短样本）；两口径均远优于官方基线。

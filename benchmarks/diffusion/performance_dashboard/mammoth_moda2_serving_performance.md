@@ -131,7 +131,58 @@ All requests succeeded (0 failures across the sweep). Latency is end-to-end per 
 
 The AR stage dominates end-to-end latency (~80%) at the default configuration; the DiT stage is the serialization bottleneck under concurrency (`max_num_seqs: 1`).
 
-## 5.4 Endpoint Fix Verification
+## 5.4 Inference-Step Sensitivity (1024x1024 / 512x512, concurrency 1)
+
+Steps 25 at 1024x1024 (half the default 50) and steps 25 at 512x512, same protocol as §5.1:
+
+| Resolution | Steps | Concurrency | Mean (s) | P50 (s) | P95 (s) | P99 (s) |
+|------------|-------|-------------|----------|---------|---------|---------|
+| 1024x1024  | 25    | 1           | 85.2     | 85.3    | 87.8    | 88.7    |
+| 1024x1024  | 25    | 4           | 113.7    | 111.5   | 127.1   | 129.4   |
+| 512x512    | 25    | 1           | 21.9     | 21.8    | 22.3    | 22.3    |
+
+Halving DiT steps does not halve end-to-end latency (96.3 → 85.2 s at 1024): the AR stage emits a fixed count of visual tokens (4,161 at 1024x1024) regardless of step count, so its ~77 s contribution is step-invariant; only the DiT sampling time scales with steps. At 512x512, steps 20 → 25 adds ~0.1 s per step (21.8 → 21.9 s).
+
+## 5.5 Prompt-Length Sensitivity (long vs short prompts)
+
+A ~430-word long prompt (repeated via `--random-request-config '[{"weight":1,"prompt":"..."}]'`) against the default short synthetic prompt, same seed and settings:
+
+| Resolution | Steps | Concurrency | Prompt | Mean (s) | P99 (s) | Throughput (img/s) |
+|------------|-------|-------------|--------|----------|---------|---------------------|
+| 1024x1024  | 50    | 1           | short  | 96.3     | 100.8   | 0.0104              |
+| 1024x1024  | 50    | 1           | long   | 93.6     | 94.4    | 0.0107              |
+| 1024x1024  | 50    | 4           | short  | 150.9    | 186.3   | 0.0238              |
+| 1024x1024  | 50    | 4           | long   | 141.7    | 174.2   | 0.0255              |
+| 512x512    | 20    | 1           | short  | 21.8     | 22.2    | 0.0459              |
+| 512x512    | 20    | 1           | long   | 22.2     | 22.5    | 0.0450              |
+
+Prompt length has no material effect on latency (the long-prompt rows are within run-to-run variance and even slightly faster with tighter P99 tails). This confirms the AR stage's cost is dominated by decoding the fixed 4,161-token visual grid, not by prompt encoding: the KV prefill of a few hundred extra text tokens is negligible against 4,161 decode steps.
+
+## 5.6 Peak GPU Memory (per-stage process, nvidia-smi polling at 1 Hz)
+
+Sampled during the §5.4/§5.5 sweeps (stage processes identified by PID; both stages share the single A800):
+
+| Configuration (worst case) | stage0_ar (MB) | stage1_dit (MB) |
+|----------------------------|----------------|-----------------|
+| 1024x1024, 50 steps, c4    | 39,290         | 11,104          |
+| all other configs          | 39,194         | 11,102–11,104   |
+
+Memory is essentially flat across the sweep: the AR stage grows by only ~96 MB at concurrency 4 and the DiT stage by 2 MB, because both stages pre-allocate from `gpu_memory_utilization` budgets (0.5 / 0.3) at startup. Combined steady-state usage ≈ 50.4 GiB of the 80 GiB device.
+
+## 5.7 DiT-Stage Component Attribution (pipeline profiler)
+
+With `enable_diffusion_pipeline_profiler: true` in the stage-1 deploy config (`MammothModa2DiTPipeline` targets: `gen_transformer.forward`, `gen_vae.decode`, `gen_image_condition_refiner.forward`), three warm 1024x1024 / 50-step requests (profiler adds a `synchronize` per call, so timings are indicative, not throughput-grade):
+
+| Component | Per request (s) | Share of DiT pipeline |
+|-----------|-----------------|-----------------------|
+| `gen_transformer.forward` (100 calls: 50 steps x 2 passes) | 14.01–14.07 | 98.6% |
+| `gen_vae.decode` (1 call) | 0.148 | 1.0% |
+| `gen_image_condition_refiner.forward` (1 call) | 0.005 | 0.03% |
+| whole `MammothModa2DiTPipeline.forward` | 14.18–14.27 | — |
+
+The DiT latency is ~99% transformer sampling; VAE decode costs only ~0.15 s per image at 1024x1024 and is not a bottleneck. Per-step transformer time is ~140 ms (two forward passes per step: ~2.8 s nominal x CFG), consistent with §5.3's 17.2 s image-TTFT figure once base64 encoding and stage handoff are included.
+
+## 5.8 Endpoint Fix Verification
 
 Before the serving fix, `/v1/images/generations` returned HTTP 503 ("No diffusion stage found in multi-stage pipeline") because the pipeline's image-output stage is a generation-LLM DiT rather than a `diffusion`-typed stage. After the fix all requests return HTTP 200 with a valid base64 image (verified across every sweep configuration above).
 
@@ -143,5 +194,8 @@ Before the serving fix, `/v1/images/generations` returned HTTP 503 ("No diffusio
 2. Warm up with one real request (any size) — do not use reduced-step warmups.
 3. Run the sweep commands from §4.1 for each row in §5.
 4. Server-side per-stage timings are printed in the engine stats table (`stage_gen_time_ms`, `output_unit_count`) at `--log-stats` level info.
+5. New rows use the same seed (`--seed 142`), `--num-prompts 8`, and `--warmup-requests 0` protocol as §4.1; result files are named `mm2_<res>_s<steps>_c<conc>[_long].json` (steps-25, long-prompt, peak-memory and profiler runs).
+6. To reproduce §5.6 peak-memory numbers, poll `nvidia-smi --query-gpu=memory.used --format=csv -l 1` per stage PID while a sweep is in flight (e.g. `nvidia-smi pmon` / `--query-compute-apps`).
+7. To reproduce §5.7, copy the bundled deploy config, set `enable_diffusion_pipeline_profiler: true` on the stage-1 entry, restart, and grep `[DiffusionPipelineProfiler]` lines from the server log; timings include a `torch.cuda.synchronize` per call.
 
 Raw per-configuration JSON outputs are stored under `benchmarks/diffusion/performance_dashboard/mammoth_moda2_serving_results/`.

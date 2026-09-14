@@ -122,14 +122,23 @@ All requests succeeded (0 failures across the sweep). Latency is end-to-end per 
 | 1024x1024  | 50    | 4           | 0.0238             |
 | 2048x2048  | 50    | 1           | 0.0037             |
 
-## 5.3 Stage Breakdown (1024x1024, 50 steps, concurrency 1, from server logs)
+## 5.3 Stage Breakdown (concurrency 1, from server logs)
 
-| Stage | Role | Gen time (s) | Notes |
-|-------|------|--------------|-------|
-| 0     | AR prompt encoder | 77.4 | 4,161 output tokens (64x64 grid + 1), TTFT 82 ms, 18.6 ms/token |
-| 1     | DiT renderer      | 17.2 | 1,048,576 pixels (1024x1024), image TTFT 17.2 s |
+Per-stage wall time from the server's `[OmniTiming]` records across the §5.1/§5.4/§5.5 sweeps (n = 18/9/5 per row; at concurrency 1 stage wall time equals `stage_gen_time_ms` in the engine stats table):
 
-The AR stage dominates end-to-end latency (~80%) at the default configuration; the DiT stage is the serialization bottleneck under concurrency (`max_num_seqs: 1`).
+| Resolution | Steps | AR stage (s) | DiT stage (s) | E2E (s) | AR share | AR output tokens | AR ms/token |
+|------------|-------|--------------|---------------|---------|----------|------------------|-------------|
+| 512x512    | 20    | 20.3         | 1.7           | 22.0    | 92%      | 1,057            | 19.2        |
+| 1024x1024  | 50    | 78.9         | 17.2          | 96.1    | 82%      | 4,161            | 19.0        |
+| 2048x2048  | 50    | 156.3        | 114.8         | 271.2   | 58%      | 8,154            | 19.2        |
+
+Stage 0 is the AR prompt encoder (TTFT 82 ms at 1024x1024); stage 1 is the DiT renderer. Three observations:
+
+1. **AR per-token cost is constant (~19 ms/token) across resolutions**, so AR time is fully predictable: the AR stage decodes a fixed visual grid whose length scales with resolution (1,057 → 4,161 → 8,154 tokens), giving `AR ≈ tokens × 19 ms`. This is also why §5.4's step sweep is sub-linear — the AR token count is step-invariant.
+2. **DiT time scales super-linearly with pixels**: a 16x pixel increase (512 → 2048) multiplies DiT time by 67 (1.7 → 114.8 s).
+3. **The dominant stage flips with resolution**: AR is 92% of E2E at 512x512 (DiT optimization is nearly pointless there) but 58% at 2048x2048, where both stages matter.
+
+At concurrency > 1, per-stage wall times additionally include intra-stage queueing (each stage serializes at `max_num_seqs: 1`), so the c2/c4 rows in §5.1 cannot be decomposed additively from this table.
 
 ## 5.4 Inference-Step Sensitivity (1024x1024 / 512x512, concurrency 1)
 
@@ -141,7 +150,7 @@ Steps 25 at 1024x1024 (half the default 50) and steps 25 at 512x512, same protoc
 | 1024x1024  | 25    | 4           | 113.7    | 111.5   | 127.1   | 129.4   |
 | 512x512    | 25    | 1           | 21.9     | 21.8    | 22.3    | 22.3    |
 
-Halving DiT steps does not halve end-to-end latency (96.3 → 85.2 s at 1024): the AR stage emits a fixed count of visual tokens (4,161 at 1024x1024) regardless of step count, so its ~77 s contribution is step-invariant; only the DiT sampling time scales with steps. At 512x512, steps 20 → 25 adds ~0.1 s per step (21.8 → 21.9 s).
+Halving DiT steps does not halve end-to-end latency (96.3 → 85.2 s at 1024): the AR stage emits a fixed count of visual tokens (4,161 at 1024x1024) regardless of step count, so its ~79 s contribution (§5.3) is step-invariant; only the DiT sampling time scales with steps. At 512x512, steps 20 → 25 adds ~0.1 s per step (21.8 → 21.9 s).
 
 ## 5.5 Prompt-Length Sensitivity (long vs short prompts)
 

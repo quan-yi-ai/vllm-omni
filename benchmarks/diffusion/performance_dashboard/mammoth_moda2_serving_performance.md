@@ -147,8 +147,8 @@ Steps 25 at 1024x1024 (half the default 50) and steps 25 at 512x512, same protoc
 | Resolution | Steps | Concurrency | Mean (s) | P50 (s) | P95 (s) | P99 (s) |
 |------------|-------|-------------|----------|---------|---------|---------|
 | 1024x1024  | 25    | 1           | 85.2     | 85.3    | 87.8    | 88.7    |
-| 1024x1024  | 25    | 4           | 113.7    | 111.5   | 127.1   | 129.4   |
-| 512x512    | 25    | 1           | 21.9     | 21.8    | 22.3    | 22.3    |
+| 1024x1024  | 25    | 4           | 113.7    | 115.8   | 126.1   | 129.4   |
+| 512x512    | 25    | 1           | 21.9     | 21.8    | 22.2    | 22.3    |
 
 Halving DiT steps does not halve end-to-end latency (96.3 → 85.2 s at 1024): the AR stage emits a fixed count of visual tokens (4,161 at 1024x1024) regardless of step count, so its ~79 s contribution (§5.3) is step-invariant; only the DiT sampling time scales with steps. At 512x512, steps 20 → 25 adds ~0.1 s per step (21.8 → 21.9 s).
 
@@ -203,8 +203,6 @@ Before the serving fix, `/v1/images/generations` returned HTTP 503 ("No diffusio
 2. Warm up with one real request (any size) — do not use reduced-step warmups.
 3. Run the sweep commands from §4.1 for each row in §5.
 4. Server-side per-stage timings are printed in the engine stats table (`stage_gen_time_ms`, `output_unit_count`) at `--log-stats` level info.
-5. New rows use the same seed (`--seed 142`), `--num-prompts 8`, and `--warmup-requests 0` protocol as §4.1; result files are named `mm2_<res>_s<steps>_c<conc>[_long].json` (steps-25, long-prompt, peak-memory and profiler runs).
+5. New rows use the same seed (`--seed 142`), `--num-prompts 8`, and `--warmup-requests 0` protocol as §4.1; when saving results with `--output-file`, name them `<res>_s<steps>_c<conc>[_long].json` to keep runs comparable (steps-25, long-prompt, peak-memory and profiler runs).
 6. To reproduce §5.6 peak-memory numbers, poll `nvidia-smi --query-gpu=memory.used --format=csv -l 1` per stage PID while a sweep is in flight (e.g. `nvidia-smi pmon` / `--query-compute-apps`).
 7. To reproduce §5.7, copy the bundled deploy config, set `enable_diffusion_pipeline_profiler: true` on the stage-1 entry, restart, and grep `[DiffusionPipelineProfiler]` lines from the server log; timings include a `torch.cuda.synchronize` per call.
-
-Raw per-configuration JSON outputs are stored under `benchmarks/diffusion/performance_dashboard/mammoth_moda2_serving_results/`.

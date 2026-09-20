@@ -17,7 +17,7 @@
 | **WER** | — | **0.0062** | — | ≤1.56% ✅（余量 2.5 倍） |
 | **SIM** | — | **0.8409** | — | ≥0.689 ✅（余量 0.15） |
 
-**与大神 910C 基线的差距属硬件差异**：大神在昇腾 910C（Atlas A3）实测 zh2020 全量
+**与KuaaMU 910C 基线的差距属硬件差异**：KuaaMU在昇腾 910C（Atlas A3）实测 zh2020 全量
 E2EL 841.98 / TTFP 236.83 / RTF 0.16606；我们在 910B2 上同口径 40 条 E2EL 994.96→910.91 /
 TTFP 333 / RTF 0.21。910B2 单 die 算力约为 910C 的一半量级，且 stage2 在 910B2 上
 kernel-launch 开销占比更高（cf. docs/minicpmo_npu_optimization_report.md §11.1
@@ -45,11 +45,11 @@ launch-bound 分析）。**两代硬件对同一份代码都远超官方基线**
 | 21 | **K12 runner-local 默认** | Stage1 窗口 8→12（scheduler `_k/sched_k` + runner `_talker_local_steps`） |
 | 22 | **TJS1 伪1步默认** | `OMNI_TJS_STOP=1`：1 步后一阶外推 `x₁=x_t+(1−t)·v` |
 
-（完整 22 项见大神 `05_optimization_report/README.md` #1-22 表格）
+（完整 22 项见KuaaMU `05_optimization_report/README.md` #1-22 表格）
 
 ### 1.2 我们的 R1 实测调优（910B2 专属，保留在 yaml）
 
-| 配置 | 值 | 大神 910C 值 | 依据 |
+| 配置 | 值 | KuaaMU 910C 值 | 依据 |
 |---|---|---|---|
 | `codec_chunk_frames` | 50 | 25 | 910B2 launch-bound，chunk 数减半（RTF −4.4% 实测） |
 | `initial_codec_chunk_frames` | 15 | （无） | 首 chunk 提前出声，首块延迟 −36% 实测 |
@@ -87,7 +87,7 @@ A/B 实测（40 条官方口径、热轮、同固定样本）：
 ### 1.4 本轮修复（commit 0864acd4）
 
 1. **K=12 错位崩溃修复**：`npu_ar_model_runner.py` `_talker_local_steps` 8→12。
-   根因：大神本地 HEAD ea66d2d2（"clean tree"）误回退 `-12 +8`，我们照抄引入
+   根因：KuaaMU本地 HEAD ea66d2d2（"clean tree"）误回退 `-12 +8`，我们沿用引入
    scheduler 12 / runner 8 的 KV 窗口错位 → speech warmup 崩溃。以其
    **origin/submit（62f4e4ab）提交版为准**修复。修复后 warmup 7.5s PASS。
 2. **W4 预热 404 修复**：`async_omni_engine.py` 预热请求 model 字段改为从
@@ -150,13 +150,13 @@ HTTP 200 / 8.46s；choices[0]=文本 + choices[1]=audio
 | 口径 | E2EL | TTFP | RTF | TTFT | WER | SIM |
 |---|---|---|---|---|---|---|
 | 官方基线 | — | 986.47 | 0.4423 | 333 | — | — |
-| 大神 910C zh2020 全量 | 841.98 | 236.83 | 0.16606 | 118.0 | 0.00987 | 0.84317 |
+| KuaaMU 910C zh2020 全量 | 841.98 | 236.83 | 0.16606 | 118.0 | 0.00987 | 0.84317 |
 | **我们 910B2 zh2020 全量** | 1044.45 | 339.35 | 0.20 | 99.20 | **0.0093** | 0.8377 |
 | 我们 910B2 40 条热轮 | 910.91 | 330.58 | 0.20 | 90.22 | 0.0062 | 0.8409 |
 | 我们 vs 官方基线（全量） | — | **−65.6%** | **−54.8%** | **−70.2%** | — | — |
-| 我们 vs 大神（含硬件差） | +24.0% | +43.3% | +20.4% | **−15.9%** | **−5.8%** | −0.65% |
+| 我们 vs KuaaMU（含硬件差） | +24.0% | +43.3% | +20.4% | **−15.9%** | **−5.8%** | −0.65% |
 
-注：全量口径我们 **WER 优于大神**（0.0093 vs 0.00987）、**TTFT 更快**（99.2 vs
+注：全量口径我们 **WER 优于KuaaMU**（0.0093 vs 0.00987）、**TTFT 更快**（99.2 vs
 118.0ms）；E2EL/RTF/TTFP 差距与 910B2/910C 单 die 算力差一致（stage2 在 910B2
 上 kernel-launch 占比更高）。
 
@@ -222,5 +222,5 @@ HF_ENDPOINT=https://hf-mirror.com SEED_TTS_SIM_EVAL=1 vllm bench serve --omni \
 2. **910B2 与 910C 配置差异是有意的**：`max_num_seqs 4 vs 8`、
    `enable_static_kernel false vs PIECEWISE` 均为 910B2 内存/编译器约束的
    实测选择（8 并发 OOM、static kernel 崩 TBE），非遗漏。
-3. **大神本地 HEAD 不可信**：其 ea66d2d2 有误回退，一切以其 origin/submit
+3. **KuaaMU本地 HEAD 不可信**：其 ea66d2d2 有误回退，一切以其 origin/submit
    62f4e4ab 为准（K12 修复的教训）。

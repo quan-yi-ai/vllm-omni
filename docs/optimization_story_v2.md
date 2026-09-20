@@ -45,13 +45,13 @@ scheduler 排队 → IPC 到 worker → 构建 metadata → kernel launch → �
 K 步完了一次性回传。调度/同步开销从 ×N 变成 ×N/K。
 
 **K=12 怎么来的**：scheduler 侧窗口（`_k/sched_k`）与 runner 侧
-（`_talker_local_steps`）必须**相等**。大神实测 12 是甜点：K 太小摊不薄开销，
+（`_talker_local_steps`）必须**相等**。KuaaMU实测 12 是甜点：K 太小摊不薄开销，
 K 太大投机错失后回滚浪费算力。
 
 **我们踩的坑（K12 事故，务必记住）**：
-- 大神本地 HEAD `ea66d2d2`（自称 "clean tree"）把 runner 侧误回退成 8，
+- KuaaMU本地 HEAD `ea66d2d2`（自称 "clean tree"）把 runner 侧误回退成 8，
   但 scheduler 侧还是 12。
-- 我们照抄了他的本地 HEAD → **scheduler 12 / runner 8 错位** → scheduler
+- 我们沿用了他的本地 HEAD → **scheduler 12 / runner 8 错位** → scheduler
   以为算了 12 步、KV 只写了 8 步，`num_computed_tokens` 超前于实际 KV →
   speech warmup 时 `assert num_tokens_scheduled > 0` 崩溃。
 - **教训**：一切以 `origin/submit`（62f4e4ab）为准；合并别人的代码先 diff
@@ -82,7 +82,7 @@ K 太大投机错失后回滚浪费算力。
 **改法**：boot 期后台线程发 24 条合成短句（覆盖评测 13-33 字符分布），
 把 Stage0/1 图捕获和 Stage2 链编译全部提前吸收。
 
-**我们修的两个 bug（大神版从未真正生效过）**：
+**我们修的两个 bug（KuaaMU版从未真正生效过）**：
 1. **hardcode 模型名 404**：预热请求 model 字段写死 `"openbmb/MiniCPM-o-4_5"`，
    而服务是路径形式启动（served model = `/workspace/.../MiniCPM-o-4_5`）→
    预热请求全部 404，**从未执行过一次**。改为从 `/v1/models` 动态解析。
@@ -114,7 +114,7 @@ K 太大投机错失后回滚浪费算力。
 
 ## 3. 910B2 特有调优（R1 实测，保留在 yaml）
 
-| 参数 | 910B2 值 | 910C 大神值 | 为什么不同 |
+| 参数 | 910B2 值 | 910C KuaaMU值 | 为什么不同 |
 |---|---|---|---|
 | `codec_chunk_frames` | 50 | 25 | 910B2 launch-bound，chunk 减半=launch 减半（RTF −4.4%） |
 | `initial_codec_chunk_frames` | 15 | 无 | 首 chunk 提前出声，首块延迟 −36% |
@@ -122,14 +122,14 @@ K 太大投机错失后回滚浪费算力。
 | stage0 `max_tokens` | 2048 | 32 | Daily-Omni 视频 QA 答案 >32 tok 会被截断 |
 | `enable_static_kernel` | false | PIECEWISE | 910B2 上 static kernel 编译崩溃 TBE |
 
-**警告**：这份 yaml 是 910B2 特化的。若在 910C 上跑，必须切回大神 910C 参数
+**警告**：这份 yaml 是 910B2 特化的。若在 910C 上跑，必须切回KuaaMU 910C 参数
 （cf25/seqs8/PIECEWISE/max_tokens 32），否则并发和吞吐反被压制。
 
 ---
 
 ## 4. 实测总账（全量 2020 条，官方口径）
 
-| 指标 | 官方基线 | 本提交 910B2 | 变化 | 大神 910C |
+| 指标 | 官方基线 | 本提交 910B2 | 变化 | KuaaMU 910C |
 |---|---|---|---|---|
 | RTF | 0.4423 | **0.20** | **−54.8%** | 0.166 |
 | TTFP | 986.47ms | **339.35ms** | **−65.6%** | 236.83 |
@@ -138,7 +138,7 @@ K 太大投机错失后回滚浪费算力。
 | WER | gate ≤1.56% | **0.0093** | PASS 余量 168× | 0.00987（我们更优） |
 | SIM | gate ≥0.689 | **0.8377** | PASS 余量 0.149 | 0.84317 |
 
-**与大神 910C 的差距全部可归因于硬件**（910B2 单 die 算力≈910C 一半量级，
+**与KuaaMU 910C 的差距全部可归因于硬件**（910B2 单 die 算力≈910C 一半量级，
 stage2 launch 开销占比更高）；而** TTFT 反而快 15.9%、WER 反而低 5.8%**——
 说明调度层优化（K14 spec + H1 + cf50/icf15）是平台无关的。
 
@@ -156,4 +156,4 @@ stage2 launch 开销占比更高）；而** TTFT 反而快 15.9%、WER 反而低
 1. W4 时序修复（懒解析）验证中——重启后看日志 `[W4-I03] full-chain prewarm done`
    且无 "could not resolve" 即生效。
 2. 910C 提交前 yaml 切换提醒（见 §3 警告）。
-3. 大神本地 HEAD 不可信原则（见 §1.1 教训）。
+3. KuaaMU本地 HEAD 不可信原则（见 §1.1 教训）。

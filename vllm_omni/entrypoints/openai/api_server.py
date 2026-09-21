@@ -2364,10 +2364,9 @@ async def edit_images(
         # 3.0 Init with system default values
         app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)
-        # Image edits (img2img) are only validated for classical diffusion
-        # stages. LLM-typed DiT stages (e.g. MammothModa2) are admitted to
-        # /v1/images/generations but not to edits until that path is validated
-        # end-to-end, so keep the pre-existing diffusion-only gate here.
+        # Image edits (img2img) remain gated to classical diffusion stages;
+        # MammothModa2 is rejected at route level by its pipeline's endpoint
+        # restrictions (test_mammoth_moda2_shared_runtime.py).
         image_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
         if not image_stage_ids:
             raise HTTPException(

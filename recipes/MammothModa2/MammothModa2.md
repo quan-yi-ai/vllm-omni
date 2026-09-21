@@ -286,6 +286,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
     --endpoint /v1/images/generations \
     --host 127.0.0.1 --port 8091 \
     --height 1024 --width 1024 --num-inference-steps 50 \
+    --extra-body '{"text_guidance_scale": 9.0, "cfg_range": [0.0, 1.0]}' \
     --num-prompts 8 --seed 142 --warmup-requests 0 \
     --output-file mm2_1024_s50_c1.json
 ```

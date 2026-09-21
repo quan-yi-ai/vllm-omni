@@ -414,7 +414,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         Prefers the diffusion od_config (single source of truth for the
         registry spec); falls back to the wrapper model arch declared on the
         final image-output stage so multistage wrappers without a diffusion
-        od_config (e.g. MammothModa2's generation-LLM DiT stage) still resolve.
+        od_config (e.g. the legacy generation-LLM DiT topology MammothModa2
+        used before #7134) still resolve.
         """
         cached = getattr(self, "_multistage_model_class_name", None)
         if cached is not None:

@@ -42,8 +42,9 @@ def is_image_generation_stage(stage_cfg: Any) -> bool:
     """Return whether a stage produces the pipeline's final image output.
 
     Covers both classical diffusion stages (``stage_type == "diffusion"``) and
-    generation-LLM stages that emit images (e.g. MammothModa2's DiT stage is
-    ``stage_type == "llm"`` with ``final_output_type == "image"``). Serving
+    generation-LLM stages that emit images (``stage_type == "llm"`` with
+    ``final_output_type == "image"`` — the legacy topology MammothModa2 used
+    before #7134 migrated it to the shared diffusion runtime). Serving
     endpoints use this so image routes accept either topology.
     """
     if get_stage_type(stage_cfg) == "diffusion":

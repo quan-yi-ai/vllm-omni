@@ -443,9 +443,10 @@ def mammoth_moda2_test_client():
     """MammothModa2-style pipeline: AR (llm) + generation-LLM DiT stage.
 
     The DiT stage is ``stage_type == "llm"`` with ``final_output_type ==
-    "image"`` (no classical diffusion stage), which is exactly the topology
-    the MammothModa2 registry entry serves. Regression guard for the 503
-    (stage discovery) and the T2I envelope / max_tokens wiring.
+    "image"`` (no classical diffusion stage) — the legacy topology
+    MammothModa2 served before #7134 migrated it to the shared diffusion
+    runtime. Regression guard for the 503 (stage discovery) and the T2I
+    envelope / max_tokens wiring on that compat path.
     """
     from fastapi import FastAPI
 
@@ -2506,9 +2507,10 @@ def test_image_edits_omitted_bot_task_stop_tokens_match_prompt_default(
 def test_generate_images_mammoth_moda2_llm_dit_pipeline_accepted(mammoth_moda2_test_client):
     """Regression: /v1/images/generations must not 503 on generation-LLM DiT stages.
 
-    MammothModa2's DiT stage is ``stage_type == "llm"`` with
-    ``final_output_type == "image"``; stage discovery previously required a
-    classical diffusion stage and returned 503 (issue #7199).
+    A generation-LLM DiT stage (``stage_type == "llm"`` with
+    ``final_output_type == "image"``, MammothModa2's topology before #7134):
+    stage discovery previously required a classical diffusion stage and
+    returned 503 (issue #7199).
     """
     response = mammoth_moda2_test_client.post(
         "/v1/images/generations",

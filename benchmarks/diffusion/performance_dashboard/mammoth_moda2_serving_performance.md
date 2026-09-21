@@ -30,7 +30,7 @@ This document covers:
 | Deploy config | `vllm_omni/deploy/mammoth_moda2.yaml` (bundled) |
 | Stage 0 (AR) | `gpu_memory_utilization: 0.5`, `enforce_eager: true`, `max_num_seqs: 100` |
 | Stage 1 (DiT) | `gpu_memory_utilization: 0.3`, `enforce_eager: true`, `max_num_seqs: 1` |
-| Default sampling | `text_guidance_scale: 9.0`, `cfg_range: [0.0, 1.0]`, `num_inference_steps: 50` |
+| Sampling params (per request) | `text_guidance_scale: 9.0`, `cfg_range: [0.0, 1.0]`, `num_inference_steps: 50` sent via `--extra-body` / `--num-inference-steps` |
 
 ---
 
@@ -80,6 +80,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
     --num-prompts 8 \
     --width <W> --height <H> \
     --num-inference-steps <S> \
+    --extra-body '{"text_guidance_scale": 9.0, "cfg_range": [0.0, 1.0]}' \
     --max-concurrency <C> \
     --warmup-requests 0 \
     --seed 142 \

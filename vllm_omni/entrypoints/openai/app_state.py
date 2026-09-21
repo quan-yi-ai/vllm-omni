@@ -57,8 +57,8 @@ def _get_engine_and_model(raw_request: Request):
             detail="Multi-stage engine not initialized. Start server with a multi-stage omni model.",
         )
 
-    # Check if there's an image generation stage (classical diffusion or
-    # LLM-typed DiT such as MammothModa2).
+    # Check if there's an image generation stage (classical diffusion, or a
+    # legacy generation-LLM DiT stage that emits images).
     # Prefer app state (compat layer populated at startup), then fall back to
     # the engine client's stage configs for refactored AsyncOmni paths.
     stage_configs = getattr(raw_request.app.state, "stage_configs", None)

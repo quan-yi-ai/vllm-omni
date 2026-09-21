@@ -2,7 +2,7 @@
 
 This document describes how to deploy and benchmark **bytedance-research/MammothModa2-Preview** (T2I) using vLLM-Omni. It includes service startup configuration, benchmark methodology, dataset settings, and performance results.
 
-MammothModa2 is a two-stage AR→DiT text-to-image pipeline: stage 0 is an autoregressive LLM that encodes the prompt into a visual-token grid, and stage 1 is a generation-LLM DiT that renders the final image (`final_output_type: image`). Unlike single-stage diffusion pipelines, `/v1/images/generations` requests traverse both stages, and the DiT stage runs with `max_num_seqs: 1` in the default deploy config, so concurrent requests serialize on the DiT stage while the AR stage batches.
+MammothModa2 is a two-stage AR→DiT text-to-image pipeline: stage 0 is an autoregressive LLM that encodes the prompt into a visual-token grid, and stage 1 is a generation-LLM DiT that renders the final image (`final_output_type: image`). Unlike single-stage diffusion pipelines, `/v1/images/generations` requests traverse both stages, and the DiT stage ran with `max_num_seqs: 1` in the then-default deploy config, so concurrent requests serialized on the DiT stage while the AR stage batched (request-level DiT batching landed later in #7476).
 
 > **Legacy-topology baseline**: all numbers in this dashboard were measured on the legacy topology, where the MammothModa2 DiT stage runs as an LLM-generation stage (`stage_type: llm`) built from `VllmConfig`, served through the LLM-typed image-stage compatibility path. #7134 migrates this pipeline to the shared diffusion runtime (DiT registered as a standard `DIFFUSION` stage built from `OmniDiffusionConfig`). These results should be treated as the pre-migration baseline and are expected to be rerun after #7134 lands; they are not directly comparable with post-migration numbers.
 
@@ -30,7 +30,7 @@ This document covers:
 | Deploy config | `vllm_omni/deploy/mammoth_moda2.yaml` (bundled) |
 | Stage 0 (AR) | `gpu_memory_utilization: 0.5`, `enforce_eager: true`, `max_num_seqs: 100` |
 | Stage 1 (DiT) | `gpu_memory_utilization: 0.3`, `enforce_eager: true`, `max_num_seqs: 1` |
-| Default sampling | `text_guidance_scale: 9.0`, `cfg_range: [0.0, 1.0]`, `num_inference_steps: 50` |
+| Sampling params (per request) | `text_guidance_scale: 9.0`, `cfg_range: [0.0, 1.0]`, `num_inference_steps: 50` sent via `--extra-body` / `--num-inference-steps` |
 
 ---
 
@@ -80,6 +80,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
     --num-prompts 8 \
     --width <W> --height <H> \
     --num-inference-steps <S> \
+    --extra-body '{"text_guidance_scale": 9.0, "cfg_range": [0.0, 1.0]}' \
     --max-concurrency <C> \
     --warmup-requests 0 \
     --seed 142 \

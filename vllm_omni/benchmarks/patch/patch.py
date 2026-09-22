@@ -2409,6 +2409,7 @@ async def async_request_openai_image_edits_omni(
                 timestamp = st
                 most_recent_text_timestamp = st
                 generated_text = ""
+                streaming_error_received = False
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
                     if not chunk_bytes:
@@ -2424,6 +2425,13 @@ async def async_request_openai_image_edits_omni(
 
                         timestamp = time.perf_counter()
                         data = json.loads(chunk)
+                        if (streaming_error := data.get("error")) is not None:
+                            streaming_error_received = True
+                            if isinstance(streaming_error, dict):
+                                output.error = str(streaming_error.get("message") or streaming_error)
+                            else:
+                                output.error = str(streaming_error)
+                            continue
                         _update_output_stage_metrics_from_payload(
                             output,
                             data,
@@ -2464,7 +2472,7 @@ async def async_request_openai_image_edits_omni(
                             output.denoise_step_latency_ms = metrics_denoise_step_ms
                 output.latency = timestamp - st
                 output.generated_text = generated_text
-                output.success = True
+                output.success = not streaming_error_received
             else:
                 data = await response.json()
                 _finalize_image_json_http_response(

@@ -1477,6 +1477,42 @@ async def test_image_edits_stream_true_uses_sse_path(mocker: MockerFixture) -> N
 
 
 @pytest.mark.asyncio
+async def test_image_edits_stream_error_marks_request_failed(mocker: MockerFixture) -> None:
+    """HTTP 200 image-edit streams can terminate with an error event."""
+    sse_chunk = (
+        b'data: {"object":"image.edit.chunk","type":"ar_delta","delta":"partial"}\n\n'
+        b'data: {"object":"error","error":{"message":"image generation failed",'
+        b'"type":"server_error","code":500}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    mock_response = MockResponse(200, [sse_chunk])
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    request = RequestFuncInput(
+        model="multi-stage-edit",
+        model_name="multi-stage-edit",
+        prompt="edit",
+        api_url="http://test.com/v1/images/edits",
+        prompt_len=2,
+        output_len=1,
+        multi_modal_content=[
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{_MIN_PNG_B64}"},
+            }
+        ],
+        extra_body={"stream": True},
+    )
+
+    output = await async_request_openai_image_edits_omni(request, mock_session, pbar=None)
+
+    assert output.success is False
+    assert output.error == "image generation failed"
+    assert output.generated_text == "partial"
+
+
+@pytest.mark.asyncio
 async def test_image_generations_e2el_includes_json_body_consume(mocker: MockerFixture) -> None:
     """E2EL must include body transfer/decode, not stop at HTTP headers."""
 
